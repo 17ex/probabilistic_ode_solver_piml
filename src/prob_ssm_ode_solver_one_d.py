@@ -19,7 +19,6 @@ def ode_filter(
         H,
         H0,
         R,
-        #z,
         EKF_approximation_order=1
         ) -> Tuple[Array, Array, Array, Array]:
         # filtering_mean,
@@ -34,20 +33,8 @@ def ode_filter(
     m_p = A @ m_f  # predictive mean
     P_p = A @ P_f @ A.T + Q  # predictive covariance
 
-    print()
-
-    print(f"filtering: {m_f}")
-    print(f"predictiv: {m_p}")
-
-    # TODO H/ H0
-    # sol_p = H0 @ m_p
-    print(f"H0: {H0}")
-    print(f"H: {H}")
-    print(f"H0@m_p: {H0@m_p}")
-    print(f"H@m_p: {H@m_p}")
     sol_p = (H0 @ m_p).squeeze()
 
-    #
     if EKF_approximation_order == 0:
         f_at_m_p = f(t, sol_p, f_args)
         H_hat = H
@@ -59,13 +46,10 @@ def ode_filter(
 
     z_hat = f_at_m_p - H @ m_p  # residual
     S = H_hat @ P_p @ H_hat.T + R  # innovation_covariance
-    # print(S)
-    print(f"sol_p: {sol_p}")
-    print(f"f_at_m_p: {f_at_m_p}")
-    print(f"z_hat: {z_hat}")
     K = P_p @ H_hat.T @ jnp.linalg.inv(S)  # Kalman gain
     m_f_next = m_p + K @ z_hat  # next filtering mean
     P_f_next = (jnp.eye(P_p.shape[-1]) - K @ H_hat) @ P_p  # next filtering covariance
+
     return m_f_next, P_f_next, m_p, P_p
 
 
@@ -109,9 +93,6 @@ def ode_smoother(
     F = jnp.eye(q + 1, q + 1, 1)
     L = jnp.zeros(q + 1).at[q].set(iwp_scale)
 
-    print(x0)
-
-    #A_inds = jnp.triu(jnp.stack([jnp.roll(jnp.arange(q + 1), i) for i in range(q + 1)]))
     A_inds = jnp.stack([jnp.arange(q + 1) - i for i in range(q + 1)])  # A_inds(i, j) = j - i
     A = jnp.triu(h ** A_inds / jax.scipy.special.factorial(A_inds))
     Q_j = jnp.stack((jnp.arange(q + 1) + 1,) * (q + 1))  # arange() + 1 to start indexing at 1.
@@ -133,7 +114,6 @@ def ode_smoother(
     H0 = jnp.zeros((1, q + 1)).at[0, 0].set(1)
     H = jnp.zeros((1, q + 1)).at[0, 1].set(1)  # TODO d > 1
 
-    # t = t0
     for n in range(N - 1):
         t = ts[-1]
         m_f, P_f = filtering_params[-1]
@@ -184,23 +164,13 @@ if __name__ == "__main__":
     R = 0
     approximation_order = 1
     ts, fp, sp, pp = ode_smoother(x0, P0, f, f_args, t0, q, h, iwp_scale, N, R, approximation_order=approximation_order)
-    #print(ts)
-    #print(fp)
-    #print(sp)
-    #print(pp)
-    # f_diffrax = lambda t, x, args: f(x)
+
     term = diffrax.ODETerm(f)
     solver = diffrax.Tsit5()
-    #t0 = 0
-    #t1 = 140
     t1 = t0 + N * h
     dt0 = 0.1
-    #y0 = (10.0, 10.0)
-    #y0 = (10.0, 10.0)
-    #args = (0.1, 0.02, 0.4, 0.02)
     saveat = diffrax.SaveAt(ts=jnp.linspace(t0, t1, N+1))
     sol = diffrax.diffeqsolve(term, solver, t0, t1, dt0, x0, args=f_args, saveat=saveat)
-    #sol = diffrax.diffeqsolve(term, solver, t0, t1, dt0, y0, args=args, saveat=saveat)
 
     plt.plot(sol.ts, sol.ys, label="Tsit5")
 
@@ -210,36 +180,5 @@ if __name__ == "__main__":
     plt.plot(ts, filtering_xs, label="Filtering")
     plt.plot(ts, smoothing_xs, label="Smoothing")
     plt.plot(ts, predictive_xs, label="Predictive")
-    #plt.plot(sol.ts, sol.ys[1], label="Predator")
     plt.legend()
     plt.show()
-    #print(type(saveat))
-    #print(jnp.linspace(0, 5, 20))
-
-    #print(type(sol.ys[0]))
-
-
-
-
-
-
-
-
-# term = diffrax.ODETerm(lotka_volterra_vf)
-# solver = diffrax.Tsit5()
-# t0 = 0
-# t1 = 140
-# dt0 = 0.1
-# y0 = (10.0, 10.0)
-# args = (0.1, 0.02, 0.4, 0.02)
-# saveat = diffrax.SaveAt(ts=jnp.linspace(t0, t1, 1000))
-# sol = diffrax.diffeqsolve(term, solver, t0, t1, dt0, y0, args=args, saveat=saveat)
-
-# plt.plot(sol.ts, sol.ys[0], label="Prey")
-# plt.plot(sol.ts, sol.ys[1], label="Predator")
-# plt.legend()
-# #plt.show()
-# print(type(saveat))
-# print(jnp.linspace(0, 5, 20))
-
-# print(type(sol.ys[0]))
