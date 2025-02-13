@@ -13,13 +13,17 @@ jax.scipy.stats.norm.pdf
 
 
 @partial(jax.jit, static_argnames=["q"])
-def get_sde_discretization(q: int, h: float) -> tuple[Array, Array]:
+def discrete_transition_matrix(q: int, h: float) -> Array:
     # TODO pass d, allow for d>1
-
     # constructs A[i, j] = h^(j - i) / (j - i)!  where j - i >= 0.
     A_exponents = jnp.stack([jnp.arange(q + 1) - i for i in range(q + 1)])
     A = jnp.triu(h ** A_exponents / jax.scipy.special.factorial(A_exponents))
+    return A
 
+
+@partial(jax.jit, static_argnames=["q"])
+def discrete_diffusion_matrix(q: int, h: float) -> Array:
+    # TODO pass d, allow for d>1
     # Q is a bit more involved, see book "Probabilistic Numerics" (Hennig, Osborne, Kersting)
     # p.51 (chapter 5: Gauss-Markov Processes: Filtering and SDEs) for the formula
     # (a reference for a detailed derivation is provided there as well).
@@ -32,6 +36,14 @@ def get_sde_discretization(q: int, h: float) -> tuple[Array, Array]:
              * Q_divisor_j
              * Q_divisor_j.T
            ))
+    return Q
+
+
+@partial(jax.jit, static_argnames=["q"])
+def discretized_sde(q: int, h: float) -> tuple[Array, Array]:
+    # TODO pass d, allow for d>1
+    A = discrete_transition_matrix(q, h)
+    Q = discrete_diffusion_matrix(q, h)
     return A, Q
 
 
@@ -164,6 +176,8 @@ def ode_smoother(
         for t in range(N - 2, -1, -1):  # shift by 1 to keep in line with Algorithm 5.4
             m_s_next, P_s_next = smoothing_params[0]  # This also yields m_s(t + 1). We just build it from the front
             m_p_next, P_p_next = predictive_params[t + 1]
+            h = ts[t + 1] - ts[t]
+            A = discrete_transition_matrix(q, h)
             m_f, P_f = filtering_params[t]
             m_s, P_s = ode_ssm_smoother_update(m_f, P_f, A, m_p_next, P_p_next, m_s_next, P_s_next)
             smoothing_params.insert(0, (m_s, P_s))
