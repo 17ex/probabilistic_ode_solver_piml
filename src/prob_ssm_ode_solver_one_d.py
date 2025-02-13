@@ -35,7 +35,50 @@ def get_sde_discretization(q: int, h: float) -> tuple[Array, Array]:
     return A, Q
 
 
-def ode_filter(
+@jax.jit
+def next_predictive_mean_and_cov(A, m_f, P_f, Q):
+    m_p = A @ m_f  # predictive mean
+    P_p = A @ P_f @ A.T + Q  # predictive covariance
+    return m_p, P_p
+
+
+def ekf_approximation(f, t, m_p, H, H0, f_args, order=1) -> tuple[Array, Array]:
+    # Not jit-able for arbitrary f; we would need: jit-able f and then recompile for every f.
+    m_p0 = (H0 @ m_p).squeeze()
+    if order == 0:
+        f_at_m_p = f(t, m_p0, f_args)
+        H_hat = H
+    elif order == 1:
+        f_at_m_p, J_f = jax.value_and_grad(f, argnums=1)(t, m_p0, f_args)
+        H_hat = H - J_f * H0  # regular * in 1-d case
+    else:
+        raise ValueError(f"Invalid value for approximation order of the EKF (has to be 0 or 1): {order}")
+    return f_at_m_p, H_hat
+
+
+@jax.jit
+def local_error_estimate(Q, H_hat) -> Array:
+    return jnp.sqrt(H_hat @ Q @ H_hat.T)
+
+
+@jax.jit
+def next_filtering_mean_and_cov(H, R, m_p, P_p, f_at_m_p, H_hat) -> tuple[Array, Array, Array]:
+    # Kalman filter statistics
+    z_hat = f_at_m_p - H @ m_p  # residual
+    S = H_hat @ P_p @ H_hat.T + R  # innovation_covariance
+    S_inv = jnp.linalg.inv(S)
+    K = P_p @ H_hat.T @ S_inv  # Kalman gain
+
+    # Next filtering mean/cov
+    m_f = m_p + K @ z_hat
+    P_f = (jnp.eye(P_p.shape[-1]) - K @ H_hat) @ P_p
+
+    # can be used to estimate the scale/variance of the IWP prior later on
+    global_uncertainty_term = z_hat.T @ S_inv @ z_hat
+    return m_f, P_f, global_uncertainty_term
+
+
+def ode_filter_step(
         m_f, P_f,
         f, f_args,
         t,
@@ -46,48 +89,14 @@ def ode_filter(
         R,
         EKF_approximation_order=1
         ) -> Tuple[Array, Array, Array, Array, Array, Array]:
-        # filtering_mean,
-        # filtering_cov,
-        # transition_matrix,
-        # process_noise,
-        # measurement_matrix, # TODO replace this for ODEs
-        # observation_noise,
-        # observation
 
-    # TODO make jit-able
-    # -> split into jit-able parts, don't jit part where f is evaluated
-    # -> also do step size adaptation etc here
-    m_p = A @ m_f  # predictive mean
-    P_p = A @ P_f @ A.T + Q  # predictive covariance
+    m_p, P_p = next_predictive_mean_and_cov(A, m_f, P_f, Q)
+    f_at_m_p, H_hat = ekf_approximation(f, t, m_p, H, H0, f_args, order=EKF_approximation_order)
 
-    sol_p = (H0 @ m_p).squeeze()
+    local_error = local_error_estimate(Q, H_hat)
 
-    if EKF_approximation_order == 0:
-        f_at_m_p = f(t, sol_p, f_args)
-        H_hat = H
-    elif EKF_approximation_order == 1:
-        f_at_m_p, J_f = jax.value_and_grad(f, argnums=1)(t, sol_p, f_args)
-        H_hat = H - J_f * H0  # regular * in 1-d case
-    else:
-        raise ValueError(f"Invalid value for argument EKF_approximation_order (has to be 0 or 1): {EKF_approximation_order}")
-
-    # Kalman filter statistics
-    z_hat = f_at_m_p - H @ m_p  # residual
-    S = H_hat @ P_p @ H_hat.T + R  # innovation_covariance
-    S_inv = jnp.linalg.inv(S)
-    K = P_p @ H_hat.T @ S_inv  # Kalman gain
-
-    # Next filtering mean/cov
-    m_f_next = m_p + K @ z_hat
-    P_f_next = (jnp.eye(P_p.shape[-1]) - K @ H_hat) @ P_p
-
-    # Error estimation
-    # global uncertainty term can be used to estimate
-    # the scale/variance of the IWP prior later on,
-    # local error is an estimate for the expected local error.
-    global_uncertainty_term = z_hat.T @ S_inv @ z_hat
-    local_error = jnp.sqrt(H_hat @ Q @ H_hat.T)
-
+    m_f_next, P_f_next, global_uncertainty_term = \
+            next_filtering_mean_and_cov(H, R, m_p, P_p, f_at_m_p, H_hat)
     return m_f_next, P_f_next, m_p, P_p, global_uncertainty_term, local_error
 
 
@@ -142,8 +151,8 @@ def ode_smoother(
         A, Q = get_sde_discretization(q, h)
         Q = Q * iwp_scale ** 2
         m_f_next, P_f_next, m_p, P_p, global_uncertainty_term, local_error = \
-                ode_filter(m_f, P_f, f, f_args, t, A, Q, H, H0, R,
-                           EKF_approximation_order=approximation_order)
+                ode_filter_step(m_f, P_f, f, f_args, t, A, Q, H, H0, R,
+                                EKF_approximation_order=approximation_order)
         filtering_params.append((m_f_next, P_f_next))
         predictive_params.append((m_p, P_p))
         global_error_terms.append(global_uncertainty_term)
