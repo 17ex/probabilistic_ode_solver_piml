@@ -6,9 +6,34 @@ import diffrax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from jaxtyping import Array
+from functools import partial
 
 
 jax.scipy.stats.norm.pdf
+
+
+@partial(jax.jit, static_argnames=["q"])
+def get_sde_discretization(q: int, h: float) -> tuple[Array, Array]:
+    # TODO pass d, allow for d>1
+
+    # constructs A[i, j] = h^(j - i) / (j - i)!  where j - i >= 0.
+    A_exponents = jnp.stack([jnp.arange(q + 1) - i for i in range(q + 1)])
+    A = jnp.triu(h ** A_exponents / jax.scipy.special.factorial(A_exponents))
+
+    # Q is a bit more involved, see book "Probabilistic Numerics" (Hennig, Osborne, Kersting)
+    # p.51 (chapter 5: Gauss-Markov Processes: Filtering and SDEs) for the formula
+    # (a reference for a detailed derivation is provided there as well).
+    Q_j = jnp.stack((jnp.arange(q + 1) + 1,) * (q + 1))
+    Q_exponent = 2 * q + 3 - Q_j.T - Q_j
+    Q_divisor_j = jax.scipy.special.factorial(q + 1 - Q_j)
+    Q = (h ** Q_exponent
+         / (
+             Q_exponent
+             * Q_divisor_j
+             * Q_divisor_j.T
+           ))
+    return A, Q
+
 
 def ode_filter(
         m_f, P_f,
@@ -84,28 +109,10 @@ def ode_smoother(
 
     # TODO for constant stepsize h: implement p.50; footnote 16 for better efficiency/stability
     d = x_initial.shape[-1]  # TODO how to handle d>1? See Kersting Sullivan Hennig 2020 Appendix B
-
     assert d == 1  # TODO
 
     # TODO where in book was this? also this so far only works for q=1
     x0 = jnp.stack([x_initial, f(t0, x_initial, f_args)])
-
-    F = jnp.eye(q + 1, q + 1, 1)
-    L = jnp.zeros(q + 1).at[q].set(iwp_scale)
-
-    A_inds = jnp.stack([jnp.arange(q + 1) - i for i in range(q + 1)])  # A_inds(i, j) = j - i
-    A = jnp.triu(h ** A_inds / jax.scipy.special.factorial(A_inds))
-    Q_j = jnp.stack((jnp.arange(q + 1) + 1,) * (q + 1))  # arange() + 1 to start indexing at 1.
-    Q_i = Q_j.T
-    Q_exponent = 2 * q + 3 - Q_i - Q_j
-    Q_divisor_j = jax.scipy.special.factorial(q + 1 - Q_j)
-    Q = (iwp_scale ** 2 * h ** Q_exponent
-         / (
-             Q_exponent
-             * Q_divisor_j
-             * Q_divisor_j.T
-           ))
-    # TODO for the above: separate into class, const. wrt. h stuff goes into init, then a get_discretization or sth that returns A(h), Q(h).
 
     ts = [t0]
     predictive_params = [(x0, P0)]  # This should be initialized empty, putting something in here to keep it in line with indexing in the book
@@ -117,6 +124,8 @@ def ode_smoother(
     for n in range(N - 1):
         t = ts[-1]
         m_f, P_f = filtering_params[-1]
+        A, Q = get_sde_discretization(q, h)
+        Q = Q * iwp_scale ** 2
         m_f_next, P_f_next, m_p, P_p = ode_filter(m_f, P_f, f, f_args, t, A, Q, H, H0, R,
                                                   EKF_approximation_order=approximation_order)
         filtering_params.append((m_f_next, P_f_next))
@@ -150,9 +159,9 @@ def linear_vf(t, x, args):
 
 
 if __name__ == "__main__":
-    x0 = jnp.array([0.2])
+    x0 = jnp.array([0.4])
     P0 = 0
-    alpha = 0.5
+    alpha = 0.2
     f = linear_vf
     f_args = (alpha, )
     q = 1
@@ -160,7 +169,7 @@ if __name__ == "__main__":
     h = 1e-3
     iwp_scale = 1
     #N = 1000
-    N = 30
+    N = 300
     R = 0
     approximation_order = 1
     ts, fp, sp, pp = ode_smoother(x0, P0, f, f_args, t0, q, h, iwp_scale, N, R, approximation_order=approximation_order)
