@@ -54,7 +54,7 @@ def next_predictive_mean_and_cov(A, m_f, P_f, Q):
     return m_p, P_p
 
 
-def ekf_approximation(f, t, m_p, H, H0, f_args, order=1) -> tuple[Array, Array]:
+def ekf_residual(f, t, m_p, H, H0, f_args, order=1) -> tuple[Array, Array]:
     # Not jit-able for arbitrary f; we would need: jit-able f and then recompile for every f.
     m_p0 = (H0 @ m_p).squeeze()
     if order == 0:
@@ -65,7 +65,8 @@ def ekf_approximation(f, t, m_p, H, H0, f_args, order=1) -> tuple[Array, Array]:
         H_hat = H - J_f * H0  # regular * in 1-d case
     else:
         raise ValueError(f"Invalid value for approximation order of the EKF (has to be 0 or 1): {order}")
-    return f_at_m_p, H_hat
+    z_hat = f_at_m_p - H @ m_p  # residual
+    return z_hat, H_hat
 
 
 @jax.jit
@@ -74,9 +75,8 @@ def local_error_estimate(Q, H_hat) -> Array:
 
 
 @jax.jit
-def next_filtering_mean_and_cov(H, R, m_p, P_p, f_at_m_p, H_hat) -> tuple[Array, Array, Array]:
+def next_filtering_mean_and_cov(R, m_p, P_p, z_hat, H_hat) -> tuple[Array, Array, Array]:
     # Kalman filter statistics
-    z_hat = f_at_m_p - H @ m_p  # residual
     S = H_hat @ P_p @ H_hat.T + R  # innovation_covariance
     S_inv = jnp.linalg.inv(S)
     K = P_p @ H_hat.T @ S_inv  # Kalman gain
@@ -86,6 +86,7 @@ def next_filtering_mean_and_cov(H, R, m_p, P_p, f_at_m_p, H_hat) -> tuple[Array,
     P_f = (jnp.eye(P_p.shape[-1]) - K @ H_hat) @ P_p
 
     # can be used to estimate the scale/variance of the IWP prior later on
+    # TODO actually, not sure if we want to use this. Look this up later on and maybe remove it.
     global_uncertainty_term = z_hat.T @ S_inv @ z_hat
     return m_f, P_f, global_uncertainty_term
 
@@ -94,21 +95,28 @@ def ode_filter_step(
         m_f, P_f,
         f, f_args,
         t,
-        A,
-        Q,
+        q,
+        h,
         H,
         H0,
         R,
         EKF_approximation_order=1
         ) -> Tuple[Array, Array, Array, Array, Array, Array]:
 
-    m_p, P_p = next_predictive_mean_and_cov(A, m_f, P_f, Q)
-    f_at_m_p, H_hat = ekf_approximation(f, t, m_p, H, H0, f_args, order=EKF_approximation_order)
+    A, Q_hat = discretized_sde(q, h)  # A: transition matrix, B: diffusion matrix
+    m_p, P_p = next_predictive_mean_and_cov(A, m_f, P_f, Q_hat)
 
+    z_hat, H_hat = ekf_residual(f, t, m_p, H, H0, f_args, order=EKF_approximation_order)
+
+    sigma_hat = z_hat.T @ z_hat / (H @ Q_hat @ H.T)
+
+    Q = Q_hat * sigma_hat ** 2
     local_error = local_error_estimate(Q, H_hat)
+    # TODO variable stepsize: check error (and reject if too large) and calculate next h and t.
+    P_p = P_p - Q_hat + Q
 
     m_f_next, P_f_next, global_uncertainty_term = \
-            next_filtering_mean_and_cov(H, R, m_p, P_p, f_at_m_p, H_hat)
+            next_filtering_mean_and_cov(R, m_p, P_p, z_hat, H_hat)
     return m_f_next, P_f_next, m_p, P_p, global_uncertainty_term, local_error
 
 
@@ -160,10 +168,8 @@ def ode_smoother(
     for n in range(N - 1):
         t = ts[-1]
         m_f, P_f = filtering_params[-1]
-        A, Q = get_sde_discretization(q, h)
-        Q = Q * iwp_scale ** 2
         m_f_next, P_f_next, m_p, P_p, global_uncertainty_term, local_error = \
-                ode_filter_step(m_f, P_f, f, f_args, t, A, Q, H, H0, R,
+                ode_filter_step(m_f, P_f, f, f_args, t, q, h, H, H0, R,
                                 EKF_approximation_order=approximation_order)
         filtering_params.append((m_f_next, P_f_next))
         predictive_params.append((m_p, P_p))
