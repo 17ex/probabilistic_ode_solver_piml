@@ -45,7 +45,7 @@ def ode_filter(
         H0,
         R,
         EKF_approximation_order=1
-        ) -> Tuple[Array, Array, Array, Array]:
+        ) -> Tuple[Array, Array, Array, Array, Array, Array]:
         # filtering_mean,
         # filtering_cov,
         # transition_matrix,
@@ -54,7 +54,9 @@ def ode_filter(
         # observation_noise,
         # observation
 
-    # TODO step size / model adaptation here
+    # TODO make jit-able
+    # -> split into jit-able parts, don't jit part where f is evaluated
+    # -> also do step size adaptation etc here
     m_p = A @ m_f  # predictive mean
     P_p = A @ P_f @ A.T + Q  # predictive covariance
 
@@ -67,15 +69,26 @@ def ode_filter(
         f_at_m_p, J_f = jax.value_and_grad(f, argnums=1)(t, sol_p, f_args)
         H_hat = H - J_f * H0  # regular * in 1-d case
     else:
-        raise Exception()  # TODO
+        raise ValueError(f"Invalid value for argument EKF_approximation_order (has to be 0 or 1): {EKF_approximation_order}")
 
+    # Kalman filter statistics
     z_hat = f_at_m_p - H @ m_p  # residual
     S = H_hat @ P_p @ H_hat.T + R  # innovation_covariance
-    K = P_p @ H_hat.T @ jnp.linalg.inv(S)  # Kalman gain
-    m_f_next = m_p + K @ z_hat  # next filtering mean
-    P_f_next = (jnp.eye(P_p.shape[-1]) - K @ H_hat) @ P_p  # next filtering covariance
+    S_inv = jnp.linalg.inv(S)
+    K = P_p @ H_hat.T @ S_inv  # Kalman gain
 
-    return m_f_next, P_f_next, m_p, P_p
+    # Next filtering mean/cov
+    m_f_next = m_p + K @ z_hat
+    P_f_next = (jnp.eye(P_p.shape[-1]) - K @ H_hat) @ P_p
+
+    # Error estimation
+    # global uncertainty term can be used to estimate
+    # the scale/variance of the IWP prior later on,
+    # local error is an estimate for the expected local error.
+    global_uncertainty_term = z_hat.T @ S_inv @ z_hat
+    local_error = jnp.sqrt(H_hat @ Q @ H_hat.T)
+
+    return m_f_next, P_f_next, m_p, P_p, global_uncertainty_term, local_error
 
 
 
@@ -112,11 +125,13 @@ def ode_smoother(
     assert d == 1  # TODO
 
     # TODO where in book was this? also this so far only works for q=1
+    # TODO p.290, I'm not sure whether this is correct yet even for q=1, look into this later.
     x0 = jnp.stack([x_initial, f(t0, x_initial, f_args)])
 
     ts = [t0]
     predictive_params = [(x0, P0)]  # This should be initialized empty, putting something in here to keep it in line with indexing in the book
     filtering_params = [(x0, P0)]
+    global_error_terms: list[Array] = []
 
     H0 = jnp.zeros((1, q + 1)).at[0, 0].set(1)
     H = jnp.zeros((1, q + 1)).at[0, 1].set(1)  # TODO d > 1
@@ -126,10 +141,12 @@ def ode_smoother(
         m_f, P_f = filtering_params[-1]
         A, Q = get_sde_discretization(q, h)
         Q = Q * iwp_scale ** 2
-        m_f_next, P_f_next, m_p, P_p = ode_filter(m_f, P_f, f, f_args, t, A, Q, H, H0, R,
-                                                  EKF_approximation_order=approximation_order)
+        m_f_next, P_f_next, m_p, P_p, global_uncertainty_term, local_error = \
+                ode_filter(m_f, P_f, f, f_args, t, A, Q, H, H0, R,
+                           EKF_approximation_order=approximation_order)
         filtering_params.append((m_f_next, P_f_next))
         predictive_params.append((m_p, P_p))
+        global_error_terms.append(global_uncertainty_term)
         t += h
         ts.append(t)
 
