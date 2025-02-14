@@ -152,10 +152,9 @@ def ode_smoother(
         x_initial, P0,
         f, f_args,
         t0,
+        t1,
         q,
         h,
-        iwp_scale,
-        N,
         R,
         adaptive_stepsize=False,
         apply_smoother=True,
@@ -183,7 +182,7 @@ def ode_smoother(
     H0 = jnp.zeros((1, q + 1)).at[0, 0].set(1)
     H = jnp.zeros((1, q + 1)).at[0, 1].set(1)  # TODO d > 1
 
-    for n in range(N - 1):
+    while True:
         t = ts[-1]
         m_f, P_f = filtering_params[-1]
         m_f_next, P_f_next, m_p, P_p, next_h = \
@@ -191,19 +190,20 @@ def ode_smoother(
                                 EKF_approximation_order=approximation_order)
         filtering_params.append((m_f_next, P_f_next))
         predictive_params.append((m_p, P_p))
-        t += h
         if adaptive_stepsize:
             h = next_h
-        ts.append(t)
+        ts.append(t + h)
+        if t >= t1:
+            break
 
     if apply_smoother:
         smoothing_params = [filtering_params[-1]]
-        for t in range(N - 2, -1, -1):  # shift by 1 to keep in line with Algorithm 5.4
-            m_s_next, P_s_next = smoothing_params[0]  # This also yields m_s(t + 1). We just build it from the front
-            m_p_next, P_p_next = predictive_params[t + 1]
-            h = ts[t + 1] - ts[t]
+        for n in range(len(filtering_params) - 2, -1, -1):  # shift by 1 to keep in line with Algorithm 5.4
+            m_s_next, P_s_next = smoothing_params[0]  # This also yields m_s(n + 1). We just build it from the front
+            m_p_next, P_p_next = predictive_params[n + 1]
+            h = ts[n + 1] - ts[n]
             A = discrete_transition_matrix(q, h)
-            m_f, P_f = filtering_params[t]
+            m_f, P_f = filtering_params[n]
             m_s, P_s = ode_ssm_smoother_update(m_f, P_f, A, m_p_next, P_p_next, m_s_next, P_s_next)
             smoothing_params.insert(0, (m_s, P_s))
     else:
@@ -226,22 +226,20 @@ def linear_vf(t, x, args):
 if __name__ == "__main__":
     x0 = jnp.array([0.4])
     P0 = 0
-    alpha = 0.2
+    alpha = 0.5
     f = linear_vf
     f_args = (alpha, )
     q = 1
     t0 = 0
-    h = 1e-3
-    iwp_scale = 1
-    #N = 1000
-    N = 300
+    initial_stepsize = 5e-3
+    N = 500
+    t1 = t0 + initial_stepsize * N
     R = 0
     approximation_order = 1
-    ts, fp, sp, pp = ode_smoother(x0, P0, f, f_args, t0, q, h, iwp_scale, N, R, approximation_order=approximation_order)
+    ts, fp, sp, pp = ode_smoother(x0, P0, f, f_args, t0, t1, q, initial_stepsize, R, approximation_order=approximation_order)
 
     term = diffrax.ODETerm(f)
     solver = diffrax.Tsit5()
-    t1 = t0 + N * h
     dt0 = 0.1
     saveat = diffrax.SaveAt(ts=jnp.linspace(t0, t1, N+1))
     sol = diffrax.diffeqsolve(term, solver, t0, t1, dt0, x0, args=f_args, saveat=saveat)
