@@ -100,24 +100,40 @@ def ode_filter_step(
         H,
         H0,
         R,
+        reltol=1e-3,
+        stepsize_safety_factor=0.9,
+        stepsize_min_change=0.2,
+        stepsize_max_change=10.0,  # as in https://arxiv.org/abs/2012.08202
         EKF_approximation_order=1
-        ) -> Tuple[Array, Array, Array, Array, Array, Array]:
+        ) -> Tuple[Array, Array, Array, Array, Array]:
 
-    A, Q_hat = discretized_sde(q, h)  # A: transition matrix, B: diffusion matrix
-    m_p, P_p = next_predictive_mean_and_cov(A, m_f, P_f, Q_hat)
+    # TODO this sucks, refactor, do full step here and just report next stepsize + local error,
+    # then let caller decide if step is rejected or not.
+    # Also, jit with static args f, q and order
 
-    z_hat, H_hat = ekf_residual(f, t, m_p, H, H0, f_args, order=EKF_approximation_order)
+    while True:
 
-    sigma_hat = z_hat.T @ z_hat / (H @ Q_hat @ H.T)
+        A, Q_hat = discretized_sde(q, h)  # A: transition matrix, B: diffusion matrix
+        m_p, P_p = next_predictive_mean_and_cov(A, m_f, P_f, Q_hat)
 
-    Q = Q_hat * sigma_hat ** 2
-    local_error = local_error_estimate(Q, H_hat)
+        z_hat, H_hat = ekf_residual(f, t, m_p, H, H0, f_args, order=EKF_approximation_order)
+
+        sigma_hat = z_hat.T @ z_hat / (H @ Q_hat @ H.T)
+
+        Q = Q_hat * sigma_hat ** 2
+        local_error = local_error_estimate(Q, H_hat)
+        stepsize_factor = stepsize_safety_factor * (reltol / local_error) ** (1.0 / q + 1.0)
+        stepsize_factor = jax.lax.clamp(stepsize_min_change, stepsize_factor, stepsize_max_change)
+        h *= stepsize_factor
+        if local_error <= reltol:
+            # accept step
+            break
     # TODO variable stepsize: check error (and reject if too large) and calculate next h and t.
     P_p = P_p - Q_hat + Q
 
     m_f_next, P_f_next, global_uncertainty_term = \
             next_filtering_mean_and_cov(R, m_p, P_p, z_hat, H_hat)
-    return m_f_next, P_f_next, m_p, P_p, global_uncertainty_term, local_error
+    return m_f_next, P_f_next, m_p, P_p, h.squeeze()
 
 
 
@@ -141,6 +157,7 @@ def ode_smoother(
         iwp_scale,
         N,
         R,
+        adaptive_stepsize=False,
         apply_smoother=True,
         approximation_order=1):
 
@@ -157,10 +174,11 @@ def ode_smoother(
     # TODO p.290, I'm not sure whether this is correct yet even for q=1, look into this later.
     x0 = jnp.stack([x_initial, f(t0, x_initial, f_args)])
 
+    if not isinstance(t0, Array):
+        t0 = jnp.array(t0)
     ts = [t0]
     predictive_params = [(x0, P0)]  # This should be initialized empty, putting something in here to keep it in line with indexing in the book
     filtering_params = [(x0, P0)]
-    global_error_terms: list[Array] = []
 
     H0 = jnp.zeros((1, q + 1)).at[0, 0].set(1)
     H = jnp.zeros((1, q + 1)).at[0, 1].set(1)  # TODO d > 1
@@ -168,13 +186,14 @@ def ode_smoother(
     for n in range(N - 1):
         t = ts[-1]
         m_f, P_f = filtering_params[-1]
-        m_f_next, P_f_next, m_p, P_p, global_uncertainty_term, local_error = \
+        m_f_next, P_f_next, m_p, P_p, next_h = \
                 ode_filter_step(m_f, P_f, f, f_args, t, q, h, H, H0, R,
                                 EKF_approximation_order=approximation_order)
         filtering_params.append((m_f_next, P_f_next))
         predictive_params.append((m_p, P_p))
-        global_error_terms.append(global_uncertainty_term)
         t += h
+        if adaptive_stepsize:
+            h = next_h
         ts.append(t)
 
     if apply_smoother:
