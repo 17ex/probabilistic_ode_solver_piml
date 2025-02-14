@@ -9,9 +9,6 @@ from jaxtyping import Array
 from functools import partial
 
 
-jax.scipy.stats.norm.pdf
-
-
 @partial(jax.jit, static_argnames=["q"])
 def discrete_transition_matrix(q: int, h: float) -> Array:
     # TODO pass d, allow for d>1
@@ -75,20 +72,17 @@ def local_error_estimate(Q, H_hat) -> Array:
 
 
 @jax.jit
-def next_filtering_mean_and_cov(R, m_p, P_p, z_hat, H_hat) -> tuple[Array, Array, Array]:
+def next_filtering_mean_and_cov(R, m_p, P_p, z_hat, H_hat) -> tuple[Array, Array]:
     # Kalman filter statistics
     S = H_hat @ P_p @ H_hat.T + R  # innovation_covariance
-    S_inv = jnp.linalg.inv(S)
+    S_inv = jnp.linalg.inv(S)  # for 1d, this is scalar
     K = P_p @ H_hat.T @ S_inv  # Kalman gain
 
     # Next filtering mean/cov
     m_f = m_p + K @ z_hat
     P_f = (jnp.eye(P_p.shape[-1]) - K @ H_hat) @ P_p
 
-    # can be used to estimate the scale/variance of the IWP prior later on
-    # TODO actually, not sure if we want to use this. Look this up later on and maybe remove it.
-    global_uncertainty_term = z_hat.T @ S_inv @ z_hat
-    return m_f, P_f, global_uncertainty_term
+    return m_f, P_f
 
 
 @partial(jax.jit, static_argnames=["f", "f_args", "q", "adaptive_stepsize", "EKF_approximation_order"])
@@ -121,9 +115,7 @@ def ode_filter_step(
 
     local_error = local_error_estimate(Q, H_hat)
 
-    # TODO remove global_uncertainty_term from next_filtering_mean_and_cov
-    m_f_next, P_f_next, global_uncertainty_term = \
-            next_filtering_mean_and_cov(R, m_p, P_p, z_hat, H_hat)
+    m_f_next, P_f_next = next_filtering_mean_and_cov(R, m_p, P_p, z_hat, H_hat)
 
     if adaptive_stepsize:
         # TODO the exponent is just wrong, fix in later commit,
