@@ -150,12 +150,20 @@ def ode_smoother(
         stepsize_min_change=0.2,
         stepsize_max_change=10.0,  # as in https://arxiv.org/abs/2012.08202
         apply_smoother=True,
-        approximation_order=1):
+        approximation_order=1) -> dict[str, Array]:
 
     h = jnp.array(h)
     stepsize_safety_factor = jnp.array(stepsize_safety_factor)
     stepsize_min_change = jnp.array(stepsize_min_change)
     stepsize_max_change = jnp.array(stepsize_max_change)
+
+    # TODO put no smoother and smother into different functions. Makes more sense.
+
+    # TODO add saveat arg and interpolate (for the no smoother variant;
+    #   it might make sense to also do this for the smoother and only run it
+    #   over the interpolated values, but that probably won't work very well,
+    #   so probably save all of them and run smoother over all, then interpolate,
+    #   hence it probably makes sense to split them up).
 
     # Assume P0 == 0 (initial x is known without uncertainty)
     P0 = jnp.zeros((q + 1, q + 1))
@@ -171,8 +179,10 @@ def ode_smoother(
     if not isinstance(t0, Array):
         t0 = jnp.array(t0)
     ts = [t0]
-    predictive_params = [(x0, P0)]  # This should be initialized empty, putting something in here to keep it in line with indexing in the book
-    filtering_params = [(x0, P0)]
+    predictive_means: list[Array] = [x0]  # just filling them to keep indexing in line with book,
+    predictive_covs: list[Array] = [P0]   # predictive_* could be initialized empty.
+    filtering_means: list[Array] = [x0]
+    filtering_covs: list[Array] = [P0]
 
     H0 = jnp.zeros((1, q + 1)).at[0, 0].set(1)
     H = jnp.zeros((1, q + 1)).at[0, 1].set(1)  # TODO d > 1
@@ -182,7 +192,7 @@ def ode_smoother(
 
     while t < t1:
         t = ts[-1]
-        m_f, P_f = filtering_params[-1]
+        m_f, P_f = filtering_means[-1], filtering_covs[-1]
         m_f_next, P_f_next, m_p, P_p, local_error, next_h = \
                 ode_filter_step(m_f, P_f, f, f_args, t, q, h, H, H0, R,
                                 reltol=reltol,
@@ -200,26 +210,36 @@ def ode_smoother(
                 continue
 
         # Step is accepted, store results
-        filtering_params.append((m_f_next, P_f_next))
-        predictive_params.append((m_p, P_p))
+        print(f"t: {t} completed")
+        filtering_means.append(m_f_next)
+        filtering_covs.append(P_f_next)
+        predictive_means.append(m_p)
+        predictive_covs.append(P_p)
         ts.append(t + h)
 
     if apply_smoother:
-        smoothing_params = [filtering_params[-1]]
-        for n in range(len(filtering_params) - 2, -1, -1):  # shift by 1 to keep in line with Algorithm 5.4
-            m_s_next, P_s_next = smoothing_params[0]  # This also yields m_s(n + 1). We just build it from the front
-            m_p_next, P_p_next = predictive_params[n + 1]
+        smoothing_means = [filtering_means[-1]]
+        smoothing_covs = [filtering_covs[-1]]
+        for n in range(len(filtering_means) - 2, -1, -1):  # shift by 1 to keep in line with Algorithm 5.4
+            m_s_next, P_s_next = smoothing_means[0], smoothing_covs[0]  # This also yields m_s(n + 1). We just build it from the front
+            m_p_next, P_p_next = predictive_means[n + 1], predictive_covs[n + 1]
             h = ts[n + 1] - ts[n]
             A = discrete_transition_matrix(q, h)
-            m_f, P_f = filtering_params[n]
+            m_f, P_f = filtering_means[n], filtering_covs[n]
             m_s, P_s = ode_ssm_smoother_update(m_f, P_f, A, m_p_next, P_p_next, m_s_next, P_s_next)
-            smoothing_params.insert(0, (m_s, P_s))
+            smoothing_means.insert(0, m_s)
+            smoothing_covs.insert(0, P_s)
+        means, covs = smoothing_means, smoothing_covs
     else:
-        smoothing_params = None
+        means, covs = filtering_means, filtering_covs
 
     # Predictive params are not actually useful,
     # return them anyways in case they are of interest eg. for visualizations
-    return ts, filtering_params, smoothing_params, predictive_params
+    return {
+            "ts": jnp.array(ts).squeeze(),
+            "ys": jnp.array(means).squeeze(),
+            "covs": jnp.array(covs).squeeze()
+    }
 
 
 
@@ -232,33 +252,41 @@ def linear_vf(t, y, args):
 
 
 if __name__ == "__main__":
-    x0 = jnp.array([0.4])
+    x0 = jnp.array([4])
     P0 = 0
-    alpha = 0.5
+    alpha = 2.0
     f = linear_vf
     f_args = (alpha, )
     q = 1
-    t0 = 0
+    t0 = 0.0
+    t1 = 3.0
     initial_stepsize = 5e-3
-    N = 500
-    t1 = t0 + initial_stepsize * N
+    adaptive_stepsize = False
+    N = 100
     R = 0
-    approximation_order = 1
-    ts, fp, sp, pp = ode_smoother(x0, P0, f, f_args, t0, t1, q, initial_stepsize, R, approximation_order=approximation_order)
+    approximation_order = 0
+    apply_smoother = True
+    prob_sol = ode_smoother(x0, P0, f, f_args, t0, t1, q, initial_stepsize, R,
+                            adaptive_stepsize=adaptive_stepsize,
+                            approximation_order=approximation_order,
+                            apply_smoother=apply_smoother)
 
     term = diffrax.ODETerm(f)
     solver = diffrax.Tsit5()
     dt0 = 0.1
     saveat = diffrax.SaveAt(ts=jnp.linspace(t0, t1, N+1))
-    sol = diffrax.diffeqsolve(term, solver, t0, t1, dt0, x0, args=f_args, saveat=saveat)
+    sol = diffrax.diffeqsolve(term, solver, t0, t1, dt0, x0,
+                              args=f_args,
+                              saveat=saveat)
+    true_d = f(sol.ts, sol.ys, f_args)
 
-    plt.plot(sol.ts, sol.ys, label="Tsit5")
+    label_prefix = "Smoothing" if apply_smoother else "Filtering"
+    ts = prob_sol["ts"]
+    ys = prob_sol["ys"][:, 0]
+    y_stddevs = jnp.sqrt(prob_sol["covs"][:, 0, 0])
 
-    filtering_xs = list(map(lambda el: el[0][0], fp))
-    predictive_xs = list(map(lambda el: el[0][0], pp))
-    smoothing_xs = list(map(lambda el: el[0][0], sp))
-    plt.plot(ts, filtering_xs, label="Filtering")
-    plt.plot(ts, smoothing_xs, label="Smoothing")
-    plt.plot(ts, predictive_xs, label="Predictive")
+    plt.plot(sol.ts, sol.ys, label="Tsit5", linewidth=4, color="black")
+    plt.plot(ts, prob_sol["ys"][:, 0], label=f"{label_prefix} mean", linewidth=1, color="darkred")
+    plt.fill_between(ts, ys - y_stddevs, ys + y_stddevs, label=f"{label_prefix} cov", linewidth=1, color="darkred", alpha=0.3)
     plt.legend()
     plt.show()
