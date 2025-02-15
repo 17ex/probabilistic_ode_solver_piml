@@ -118,14 +118,11 @@ def ode_filter_step(
     m_f_next, P_f_next = next_filtering_mean_and_cov(R, m_p, P_p, z_hat, H_hat)
 
     if adaptive_stepsize:
-        # TODO the exponent is just wrong, fix in later commit,
-        # maybe that's why adaptive stepsize didnt work lol
-        stepsize_factor = stepsize_safety_factor * (reltol / local_error) ** (1.0 / q + 1.0)
+        stepsize_factor = stepsize_safety_factor * (reltol / local_error) ** (1.0 / (q + 1.0))
         stepsize_factor = jax.lax.clamp(stepsize_min_change, stepsize_factor, stepsize_max_change)
         h = (h * stepsize_factor).squeeze()
 
     return m_f_next, P_f_next, m_p, P_p, local_error, h
-
 
 
 def ode_ssm_smoother_update(
