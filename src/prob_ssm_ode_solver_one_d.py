@@ -1,9 +1,11 @@
 from ctypes import Union
 from typing import Self, Tuple, Optional
 import jax
+import scipy
+import numpy as np
+import jax.numpy as jnp
 import quadax
 import diffrax
-import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from jaxtyping import Array
 from functools import partial
@@ -45,6 +47,32 @@ def discretized_sde(d: int, q: int, h: float) -> tuple[Array, Array]:
 
 
 @partial(jax.jit, static_argnames=["d", "q"])
+def discrete_transition_matrix_ns(d: int, q: int) -> Array:
+    # constructs A[i, j] = binom(q - i, q - j) if j - i >= 0, else 0
+    # calculation in int should (?) be more accurate than in float (with gamma)
+    K = q - np.repeat(np.expand_dims(np.arange(q + 1), 0), q + 1, 0)
+    A = jnp.triu(scipy.special.comb(K.T, K)).astype(float)  # triu not needed, left for clarity
+    return jnp.kron(A, jnp.eye(d))
+
+
+@partial(jax.jit, static_argnames=["d", "q"])
+def discrete_diffusion_matrix_ns(d: int, q: int) -> Array:
+    # Q is a bit more involved, see book "Probabilistic Numerics" (Hennig, Osborne, Kersting)
+    # p.51 (chapter 5: Gauss-Markov Processes: Filtering and SDEs) for the formula
+    # (a reference for a detailed derivation is provided there as well).
+    Q_j = jnp.stack((jnp.arange(q + 1) + 1,) * (q + 1))
+    Q = 1.0 / (2 * q + 3 - Q_j.T - Q_j)
+    return jnp.kron(Q, jnp.eye(d))
+
+
+@partial(jax.jit, static_argnames=["d", "q"])
+def discretized_sde_ns(d: int, q: int) -> tuple[Array, Array]:
+    A = discrete_transition_matrix_ns(d, q)
+    Q = discrete_diffusion_matrix_ns(d, q)
+    return A, Q
+
+
+@partial(jax.jit, static_argnames=["d", "q"])
 def ssm_projection_matrices(d, q) -> tuple[Array, Array]:
     # Projections: project SSM state -> y (H0) or SSM state -> y' (H)
     H0 = jnp.zeros((1, q + 1)).at[0, 0].set(1.0)
@@ -55,6 +83,18 @@ def ssm_projection_matrices(d, q) -> tuple[Array, Array]:
     return H0, H
 
 
+@partial(jax.jit, static_argnames=["d", "q"])
+def nordsieck_coord_transformation(d, q, h) -> tuple[Array, Array]:
+    qs = jnp.flip(jnp.arange(q + 1), 0)
+    # cumprod vs factorial? Probably will make no difference as both
+    # are constant under jit, but maybe test this out later?
+    T_diag = jnp.sqrt(h) * (h ** qs / jax.scipy.special.factorial(qs))
+    T_inv_diag = 1.0 / T_diag
+    T = jnp.kron(jnp.diag(T_diag), jnp.eye(d))
+    T_inv = jnp.kron(jnp.diag(T_inv_diag), jnp.eye(d))
+    return T, T_inv
+
+
 @jax.jit
 def next_predictive_mean_and_cov(A, m_f, P_f, Q):
     m_p = A @ m_f  # predictive mean
@@ -63,8 +103,8 @@ def next_predictive_mean_and_cov(A, m_f, P_f, Q):
 
 
 @partial(jax.jit, static_argnames=["f", "f_args", "approximation_order"])
-def ekf_residual(f, t, m_p, H, H0, f_args, approximation_order) -> tuple[Array, Array]:
-    m_p0 = H0 @ m_p
+def ekf_residual(f, t, m_p, H, H0, T, f_args, approximation_order) -> tuple[Array, Array]:
+    m_p0 = H0 @ T @ m_p
     f_at_m_p = f(t, m_p0, f_args)
     if approximation_order == 0:
         H_hat = H
@@ -73,7 +113,8 @@ def ekf_residual(f, t, m_p, H, H0, f_args, approximation_order) -> tuple[Array, 
         H_hat = H - J_f @ H0  # regular * in 1-d case
     else:
         raise ValueError(f"Invalid value for approximation order of the EKF (has to be 0 or 1): {approximation_order}")
-    z_hat = f_at_m_p - H @ m_p  # residual
+    z_hat = f_at_m_p - H @ T @ m_p  # residual
+    H_hat = H_hat @ T.T  # not 100% sure about transpose here, check later
     return z_hat, H_hat
 
 
@@ -111,11 +152,14 @@ def ode_filter_step(
         stepsize_min_change,
         stepsize_max_change,  # as in https://arxiv.org/abs/2012.08202
         EKF_approximation_order
-        ) -> Tuple[Array, Array, Array, Array, Array, Array]:
-    A, Q_hat = discretized_sde(d, q, h)  # A: transition matrix, Q: diffusion matrix
-    m_p, P_p = next_predictive_mean_and_cov(A, m_f, P_f, Q_hat)
+        ) -> Tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+    A, Q_hat = discretized_sde_ns(d, q)  # A: transition matrix, Q: diffusion matrix
+    T, T_inv = nordsieck_coord_transformation(d, q, h)
+    m_f_scaled = T_inv @ m_f
+    P_f_scaled = T_inv @ P_f @ T_inv.T
+    m_p, P_p = next_predictive_mean_and_cov(A, m_f_scaled, P_f_scaled, Q_hat)
 
-    z_hat, H_hat = ekf_residual(f, t, m_p, H, H0, f_args,
+    z_hat, H_hat = ekf_residual(f, t, m_p, H, H0, T, f_args,
                                 approximation_order=EKF_approximation_order)
     sigma_hat = z_hat.T @ jnp.linalg.inv(H @ Q_hat @ H.T) @ z_hat
 
@@ -125,25 +169,29 @@ def ode_filter_step(
     local_error = local_error_estimate(Q, H_hat)
 
     m_f_next, P_f_next = next_filtering_mean_and_cov(R, m_p, P_p, z_hat, H_hat)
+    m_f_next = T @ m_f_next  # Output in original coordinates
+    P_f_next = T @ P_f_next @ T.T
 
     if adaptive_stepsize:
         stepsize_factor = stepsize_safety_factor * (reltol / local_error) ** (1.0 / (q + 1.0))
         stepsize_factor = jax.lax.clamp(stepsize_min_change, stepsize_factor, stepsize_max_change)
         h = (h * stepsize_factor).squeeze()
 
-    return m_f_next, P_f_next, m_p, P_p, local_error, h
+    return m_f_next, P_f_next, m_f_scaled, P_f_scaled, m_p, P_p, T, T_inv, local_error, h
 
 
 @jax.jit
 def ode_ssm_smoother_update(
         m_f, P_f,
-        A,
+        A, T,
         m_p_next, P_p_next,
-        m_s_next, P_s_next) -> Tuple[Array, Array]:
+        m_s_next, P_s_next) -> Tuple[Array, Array, Array, Array]:
     G = P_f @ A.T @ jnp.linalg.inv(P_p_next)  # gain
     m_s = m_f + G @ (m_s_next - m_p_next)  # posterior mean
     P_s = P_f + G @ (P_s_next - P_p_next) @ G.T  # posterior covariance
-    return m_s, P_s
+    m_s_unscaled = T @ m_s
+    P_s_unscaled = T @ P_s @ T.T
+    return m_s, P_s, m_s_unscaled, P_s_unscaled
 
 
 @jax.jit
@@ -163,13 +211,13 @@ def ode_filter(
         q,
         h,
         R,
-        saveat: Optional[Array] = None,
-        reltol=1e-1,
-        adaptive_stepsize=True,
-        stepsize_safety_factor=0.9,
-        stepsize_min_change=0.2,
-        stepsize_max_change=10.0,  # as in https://arxiv.org/abs/2012.08202
-        approximation_order=1) -> dict[str, Array]:
+        saveat,
+        reltol,
+        adaptive_stepsize,
+        stepsize_safety_factor,
+        stepsize_min_change,
+        stepsize_max_change,
+        approximation_order) -> dict[str, Array]:
 
     if saveat is None:
         save_all = True
@@ -197,29 +245,38 @@ def ode_filter(
     x0 = jnp.stack([y_initial, f(t0, y_initial, f_args)]).flatten()
     P0 = jnp.kron(jnp.zeros((q + 1, q + 1)), jnp.eye(d))  # Assume no uncertainty in x0
     # Init. book-keeping of results
+    # TODO clean up this mess after implementation works
     rejected_steps = 0
     ts: list[Array] = [t0]
-    filtering_means: list[Array] = [x0]
-    filtering_covs: list[Array] = [P0]
-    predictive_means: list[Array] = [x0]  # Only used further if save_all
-    predictive_covs: list[Array] = [P0]
+    filtering_means_unscaled: list[Array] = [x0]
+    filtering_covs_unscaled: list[Array] = [P0]
+    filtering_means: list[Array] = []  # Only used further if save_all
+    filtering_covs: list[Array] = []
+    predictive_means: list[Array] = []  # Only used further if save_all
+    predictive_covs: list[Array] = []
+    Ts: list[Array] = []
+    T_invs: list[Array] = []
     # Init. loop variables
     t_prev = t0
     m_f_prev = x0  # Filtering mean (of previous step)
     P_f_prev = P0  # Filtering cov (of previous step)
     save_t_ind = 0
 
-    def store_vals(t, m_f, P_f, m_p, P_p):
+    def store_vals(t, m_f, P_f, m_f_scaled, P_f_scaled, m_p, P_p, T, T_inv):
         ts.append(t)
-        filtering_means.append(m_f)
-        filtering_covs.append(P_f)
+        filtering_means_unscaled.append(m_f)
+        filtering_covs_unscaled.append(P_f)
         if save_all:
+            filtering_means.append(m_f_scaled)
+            filtering_covs.append(P_f_scaled)
             predictive_means.append(m_p)
             predictive_covs.append(P_p)
+            Ts.append(T)
+            T_invs.append(T_inv)
 
     # The ODE filter/solver loop
     while t_prev < t1:
-        m_f, P_f, m_p, P_p, local_error, next_h = \
+        m_f, P_f, m_f_prev_scaled, P_f_prev_scaled, m_p, P_p, T, T_inv, local_error, next_h = \
                 ode_filter_step(m_f_prev, P_f_prev, f, f_args, t_prev, d, q, h, H, H0, R,
                                 reltol=reltol,
                                 adaptive_stepsize=adaptive_stepsize,
@@ -236,14 +293,14 @@ def ode_filter(
                 continue
         # Step is accepted: store results
         if save_all:
-            store_vals(t, m_f, P_f, m_p, P_p)
+            store_vals(t, m_f, P_f, m_f_prev_scaled, P_f_prev_scaled, m_p, P_p, T, T_inv)
         else:
             while save_t_ind < saveat.shape[0] and saveat[save_t_ind] <= t:
                 # interpolate over saveat points
                 save_t = saveat[save_t_ind]
                 m, P = linear_interpolation_mean_cov(
                         t_prev, t, save_t, m_f_prev, m_f, P_f_prev, P_f)
-                store_vals(save_t, m, P, None, None)
+                store_vals(save_t, m, P, None, None, None, None, None, None)
                 save_t_ind += 1
             if save_t_ind == saveat.shape[0]:
                 break  # May as well stop here.
@@ -254,17 +311,21 @@ def ode_filter(
     # Format and return results
     result_dict = {"num_rejected": jnp.array(rejected_steps)}
     if save_all:
-        result_dict["ys_predictive"] = jnp.array(predictive_means).squeeze()
+        result_dict["xs_predictive"] = jnp.array(predictive_means).squeeze()
         result_dict["covs_predictive"] = jnp.array(predictive_covs).squeeze()
+        result_dict["xs_filtering"] = jnp.array(predictive_means).squeeze()
+        result_dict["covs_filtering"] = jnp.array(predictive_covs).squeeze()
+        result_dict["Ts"] = jnp.array(Ts).squeeze()
+        result_dict["T_invs"] = jnp.array(T_invs).squeeze()
     else:
         # Remove first element (as it was inserted automatically)
         # to return elements only at saveat.
-        for l in [ts, filtering_means, filtering_covs]:
+        for l in [ts, filtering_means_unscaled, filtering_covs_unscaled]:
             l.pop(0)
     result_dict["ts"] = jnp.array(ts).squeeze()
-    result_dict["ys"] = jnp.array(filtering_means).squeeze()
-    result_dict["covs"] = jnp.array(filtering_covs).squeeze()
-    result_dict["H"] = H
+    result_dict["ys"] = jnp.array(filtering_means_unscaled).squeeze()
+    result_dict["covs"] = jnp.array(filtering_covs_unscaled).squeeze()
+    result_dict["H"] = H  # TODO don't array()
     result_dict["H0"] = H0
     result_dict["d"] = jnp.array(d)
     result_dict["q"] = jnp.array(q)
@@ -274,11 +335,13 @@ def ode_filter(
 def ode_smoother(filter_results: dict[str, Array],
                  saveat: Optional[Array] = None) -> dict[str, Array]:
     # Setup, retrieve parameters
-    predictive_means = filter_results["ys_predictive"]
+    predictive_means = filter_results["xs_predictive"]  # All: transformed
     predictive_covs = filter_results["covs_predictive"]
-    filtering_means = filter_results["ys"]
-    filtering_covs = filter_results["covs"]
+    filtering_means = filter_results["xs_filtering"]
+    filtering_covs = filter_results["covs_filtering"]
     ts = filter_results["ts"]
+    Ts = filter_results["Ts"]
+    T_invs = filter_results["T_invs"]
     N, d, q = ts.shape[0], filter_results["d"].item(), filter_results["q"].item()
     if saveat is not None:
         save_all = False
@@ -287,50 +350,57 @@ def ode_smoother(filter_results: dict[str, Array],
         save_all = True
         save_t_ind = 0
     t_next = ts[-1]
-    m_s_next = filtering_means[-1, ...]
-    P_s_next = filtering_covs[-1, ...]
+    T_inv_last = T_invs[-1]
+    m_s_next_unscaled = filter_results["ys"][-1]
+    P_s_next_unscaled = filter_results["covs"][-1]
+    m_s_next = T_inv_last @ m_s_next_unscaled
+    P_s_next = T_inv_last @ P_s_next_unscaled @ T_inv_last.T
     smoothing_ts = [t_next]
-    smoothing_means = [m_s_next]
-    smoothing_covs = [P_s_next]
+    smoothing_means_unscaled = [m_s_next_unscaled]
+    smoothing_covs_unscaled = [P_s_next_unscaled]
 
     def store_vals(t, m, P):
         smoothing_ts.insert(0, t)
-        smoothing_means.insert(0, m)
-        smoothing_covs.insert(0, P)
+        smoothing_means_unscaled.insert(0, m)
+        smoothing_covs_unscaled.insert(0, P)
 
     # The actual smoothing iterations
     for n in range(N - 2, -1, -1):  # shift by 1 due to zero-based indexing
-        m_p_next, P_p_next = predictive_means[n + 1, ...], predictive_covs[n + 1, ...]
+        # [N - 2, 1]
+        m_p_next, P_p_next = predictive_means[n, ...], predictive_covs[n, ...]
         m_f, P_f = filtering_means[n, ...], filtering_covs[n, ...]
+        T = Ts[n, ...]
         t = ts[n]
-        h = t_next - t
-        A = discrete_transition_matrix(d, q, h)
-        # TODO h and A can go in the step function (and rename below to _step)
-        m_s, P_s = ode_ssm_smoother_update(m_f, P_f, A, m_p_next, P_p_next, m_s_next, P_s_next)
-
+        A = discrete_transition_matrix_ns(d, q)
+        # TODO A can go in the step function (and rename below to _step)
+        # TODO put mul. with H0 (@T@m_s etc) in _update later on
+        m_s, P_s, m_s_unscaled, P_s_unscaled = \
+                ode_ssm_smoother_update(m_f, P_f, A, T, m_p_next, P_p_next, m_s_next, P_s_next)
         # Store results
         if save_all:
-            store_vals(t, m_s, P_s)
+            store_vals(t, m_s_unscaled, P_s_unscaled)
         else:
             while save_t_ind >= 0 and saveat[save_t_ind] >= t:
                 # interpolate over saveat points
                 save_t = saveat[save_t_ind]
                 m, P = linear_interpolation_mean_cov(
-                        t, t_next, save_t, m_s, m_s_next, P_s, P_s_next)
+                        t, t_next, save_t, m_s_unscaled, m_s_next_unscaled,
+                        P_s_unscaled, P_s_next_unscaled)
                 store_vals(save_t, m, P)
                 save_t_ind -= 1
             if save_t_ind < 0:
                 break  # May as well stop here.
         m_s_next, P_s_next, t_next = m_s, P_s, t
+        m_s_next_unscaled, P_s_next_unscaled = m_s_unscaled, P_s_unscaled
 
-    del filter_results["ys_predictive"]
+    del filter_results["xs_predictive"]
     del filter_results["covs_predictive"]
     if not save_all:
-        for l in [smoothing_ts, smoothing_means, smoothing_covs]:
+        for l in [smoothing_ts, smoothing_means_unscaled, smoothing_covs_unscaled]:
             l.pop()  # Remove first inserted item (which was not inserted according to saveat).
     filter_results["ts"] = jnp.array(smoothing_ts).squeeze()
-    filter_results["ys"] = jnp.array(smoothing_means).squeeze()
-    filter_results["covs"] = jnp.array(smoothing_covs).squeeze()
+    filter_results["ys"] = jnp.array(smoothing_means_unscaled).squeeze()
+    filter_results["covs"] = jnp.array(smoothing_covs_unscaled).squeeze()
     return filter_results
 
 
@@ -393,12 +463,13 @@ if __name__ == "__main__":
     N = 100
     R = 0  # ~measurement cov (-> cov of z)
     approximation_order = 1
-    apply_smoother = True
+    apply_smoother = False
     grid = jnp.linspace(t0, t1, N)
+    use_grid = True
     prob_sol = ode_filter_and_smoother(y0, P0, f, f_args, t0, t1, q, initial_stepsize, R,
                                        adaptive_stepsize=adaptive_stepsize,
                                        approximation_order=approximation_order,
-                                       saveat=grid,
+                                       saveat=grid if use_grid else None,
                                        apply_smoother=apply_smoother)
 
     term = diffrax.ODETerm(f)
