@@ -44,7 +44,6 @@ def discretized_sde(d: int, q: int, h: float) -> tuple[Array, Array]:
     return A, Q
 
 
-@partial(jax.jit, static_argnames=["d", "q"])
 def discrete_transition_matrix_ns(d: int, q: int) -> Array:
     # constructs A[i, j] = binom(q - i, q - j) if j - i >= 0, else 0
     # calculation in int should (?) be more accurate than in float (with gamma)
@@ -53,7 +52,6 @@ def discrete_transition_matrix_ns(d: int, q: int) -> Array:
     return jnp.kron(A, jnp.eye(d))
 
 
-@partial(jax.jit, static_argnames=["d", "q"])
 def discrete_diffusion_matrix_ns(d: int, q: int) -> Array:
     # Q is a bit more involved, see book "Probabilistic Numerics" (Hennig, Osborne, Kersting)
     # p.51 (chapter 5: Gauss-Markov Processes: Filtering and SDEs) for the formula
@@ -63,14 +61,12 @@ def discrete_diffusion_matrix_ns(d: int, q: int) -> Array:
     return jnp.kron(Q, jnp.eye(d))
 
 
-@partial(jax.jit, static_argnames=["d", "q"])
 def discretized_sde_ns(d: int, q: int) -> tuple[Array, Array]:
     A = discrete_transition_matrix_ns(d, q)
     Q = discrete_diffusion_matrix_ns(d, q)
     return A, Q
 
 
-@partial(jax.jit, static_argnames=["d", "q"])
 def ssm_projection_matrices(d, q) -> tuple[Array, Array]:
     # Projections: project SSM state -> y (H0) or SSM state -> y' (H)
     H0 = jnp.zeros((1, q + 1)).at[0, 0].set(1.0)
@@ -140,6 +136,8 @@ def ode_filter_step(
         f, f_args,
         t, h,
         d, q,
+        A, Q_hat,
+        H0, H,
         R,
         reltol,
         adaptive_stepsize,
@@ -148,8 +146,6 @@ def ode_filter_step(
         stepsize_max_change,  # as in https://arxiv.org/abs/2012.08202
         EKF_approximation_order
         ) -> Tuple[Array, Array, Array, Array, Array, Array, Array, Array]:
-    A, Q_hat = discretized_sde_ns(d, q)  # A: transition matrix, Q: diffusion matrix
-    H0, H = ssm_projection_matrices(d, q)
     T, T_inv = nordsieck_coord_transformation(d, q, h)
     m_f_scaled = T_inv @ m_f
     P_f_scaled = T_inv @ P_f @ T_inv.T
@@ -183,10 +179,7 @@ def ode_ssm_smoother_update(
         m_f, P_f,
         m_p_next, P_p_next,
         m_s_next, P_s_next,
-        h, d, q) -> Tuple[Array, Array, Array, Array]:
-    A = discrete_transition_matrix_ns(d, q)
-    A = discrete_transition_matrix_ns(d, q)
-    H0, _ = ssm_projection_matrices(d, q)
+        A, H0, h, d, q) -> Tuple[Array, Array, Array, Array]:
     T, T_inv = nordsieck_coord_transformation(d, q, h)
     m_s_next = T_inv @ m_s_next
     P_s_next = T_inv @ P_s_next @ T_inv.T
@@ -245,6 +238,10 @@ def ode_filter(
     x0 = jnp.stack([y_initial, f(t0, y_initial, f_args)]).flatten()
     stddev0 = jnp.zeros_like(y_initial)
     P0 = jnp.diag(jnp.repeat(stddev0, q + 1))  # Assume no uncertainty in x0
+
+    A, Q = discretized_sde_ns(d, q)
+    H0, H = ssm_projection_matrices(d, q)
+
     # Init. book-keeping of results
     rejected_steps = 0
     ts, ys, stddevs = [], [], []
@@ -265,7 +262,8 @@ def ode_filter(
     # The ODE filter/solver loop
     while t_prev < t1:
         m_f, P_f, y, stddev, local_error, next_h, m_p, P_p = \
-                ode_filter_step(m_f_prev, P_f_prev, f, f_args, t_prev, h, d, q, R,
+                ode_filter_step(m_f_prev, P_f_prev, f, f_args, t_prev, h, d, q,
+                                A, Q, H0, H, R,
                                 reltol=reltol,
                                 adaptive_stepsize=adaptive_stepsize,
                                 stepsize_safety_factor=stepsize_safety_factor,
@@ -316,7 +314,8 @@ def ode_filter(
                 "filtering_means": filtering_means,
                 "filtering_covs": filtering_covs,
                 "d": d, "q": q,
-                "last_y": y, "last_stddev": stddev}
+                "last_y": y, "last_stddev": stddev,
+                "A": A, "H0": H0}
     else:
         return {
                 "ts": jnp.asarray(ts).squeeze(),
@@ -325,15 +324,16 @@ def ode_filter(
                 }
 
 
-def ode_smoother(filter_results: dict[str, Array],
+def ode_smoother(f_out: dict[str, Array],
                  saveat: Optional[Array] = None) -> dict[str, Array]:
     # Setup, retrieve parameters
-    predictive_means = filter_results["predictive_means"]
-    predictive_covs = filter_results["predictive_covs"]
-    filtering_means = filter_results["filtering_means"]
-    filtering_covs = filter_results["filtering_covs"]
-    ts = filter_results["ts"]
-    N, d, q = len(ts), filter_results["d"], filter_results["q"]
+    predictive_means = f_out["predictive_means"]
+    predictive_covs = f_out["predictive_covs"]
+    filtering_means = f_out["filtering_means"]
+    filtering_covs = f_out["filtering_covs"]
+    ts = f_out["ts"]
+    N, d, q = len(ts), f_out["d"], f_out["q"]
+    A, H0 = f_out["A"], f_out["H0"]
     save_t_ind = 0
     if saveat is not None:
         save_all = False
@@ -343,8 +343,8 @@ def ode_smoother(filter_results: dict[str, Array],
     t_next = ts[-1]
     m_s_next = filtering_means[-1]
     P_s_next = filtering_covs[-1]
-    y_next = filter_results["last_y"]
-    stddev_next = filter_results["last_stddev"]
+    y_next = f_out["last_y"]
+    stddev_next = f_out["last_stddev"]
     smoothing_ts = [t_next]
     smoothing_ys = [y_next]
     smoothing_stddevs = [stddev_next]
@@ -363,8 +363,8 @@ def ode_smoother(filter_results: dict[str, Array],
         m_f, P_f = filtering_means[n], filtering_covs[n]
         t = ts[n]
         h = ts[n + 1] - t
-        m_s, P_s, y, stddev = ode_ssm_smoother_update(m_f, P_f, m_p_next, P_p_next,
-                                                      m_s_next, P_s_next, h, d, q)
+        m_s, P_s, y, stddev = ode_ssm_smoother_update(
+                m_f, P_f, m_p_next, P_p_next, m_s_next, P_s_next, A, H0, h, d, q)
         # Store results
         if save_all:
             store_vals(t, y, stddev)
