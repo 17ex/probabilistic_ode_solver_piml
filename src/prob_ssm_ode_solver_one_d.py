@@ -8,19 +8,20 @@ import matplotlib.pyplot as plt
 from jaxtyping import Array
 from functools import partial
 
+# TODO decide if using fp64 is a good idea
+jax.config.update("jax_enable_x64", True)
 
-@partial(jax.jit, static_argnames=["q"])
-def discrete_transition_matrix(q: int, h: float) -> Array:
-    # TODO pass d, allow for d>1
+
+@partial(jax.jit, static_argnames=["d", "q"])
+def discrete_transition_matrix(d: int, q: int, h: float) -> Array:
     # constructs A[i, j] = h^(j - i) / (j - i)!  where j - i >= 0.
     A_exponents = jnp.stack([jnp.arange(q + 1) - i for i in range(q + 1)])
     A = jnp.triu(h ** A_exponents / jax.scipy.special.factorial(A_exponents))
-    return A
+    return jnp.kron(A, jnp.eye(d))
 
 
-@partial(jax.jit, static_argnames=["q"])
-def discrete_diffusion_matrix(q: int, h: float) -> Array:
-    # TODO pass d, allow for d>1
+@partial(jax.jit, static_argnames=["d", "q"])
+def discrete_diffusion_matrix(d: int, q: int, h: float) -> Array:
     # Q is a bit more involved, see book "Probabilistic Numerics" (Hennig, Osborne, Kersting)
     # p.51 (chapter 5: Gauss-Markov Processes: Filtering and SDEs) for the formula
     # (a reference for a detailed derivation is provided there as well).
@@ -33,15 +34,25 @@ def discrete_diffusion_matrix(q: int, h: float) -> Array:
              * Q_divisor_j
              * Q_divisor_j.T
            ))
-    return Q
+    return jnp.kron(Q, jnp.eye(d))
 
 
-@partial(jax.jit, static_argnames=["q"])
-def discretized_sde(q: int, h: float) -> tuple[Array, Array]:
-    # TODO pass d, allow for d>1
-    A = discrete_transition_matrix(q, h)
-    Q = discrete_diffusion_matrix(q, h)
+@partial(jax.jit, static_argnames=["d", "q"])
+def discretized_sde(d: int, q: int, h: float) -> tuple[Array, Array]:
+    A = discrete_transition_matrix(d, q, h)
+    Q = discrete_diffusion_matrix(d, q, h)
     return A, Q
+
+
+@partial(jax.jit, static_argnames=["d", "q"])
+def ssm_projection_matrices(d, q) -> tuple[Array, Array]:
+    # Projections: project SSM state -> y (H0) or SSM state -> y' (H)
+    H0 = jnp.zeros((1, q + 1)).at[0, 0].set(1.0)
+    H = jnp.zeros((1, q + 1)).at[0, 1].set(1.0)
+    Id = jnp.eye(d)
+    H0 = jnp.kron(H0, Id)
+    H = jnp.kron(H, Id)
+    return H0, H
 
 
 @jax.jit
@@ -51,46 +62,45 @@ def next_predictive_mean_and_cov(A, m_f, P_f, Q):
     return m_p, P_p
 
 
-@partial(jax.jit, static_argnames=["f", "f_args", "order"])
-def ekf_residual(f, t, m_p, H, H0, f_args, order=1) -> tuple[Array, Array]:
-    m_p0 = (H0 @ m_p).squeeze()
-    if order == 0:
-        f_at_m_p = f(t, m_p0, f_args)
+@partial(jax.jit, static_argnames=["f", "f_args", "approximation_order"])
+def ekf_residual(f, t, m_p, H, H0, f_args, approximation_order) -> tuple[Array, Array]:
+    m_p0 = H0 @ m_p
+    f_at_m_p = f(t, m_p0, f_args)
+    if approximation_order == 0:
         H_hat = H
-    elif order == 1:
-        f_at_m_p, J_f = jax.value_and_grad(f, argnums=1)(t, m_p0, f_args)
-        H_hat = H - J_f * H0  # regular * in 1-d case
+    elif approximation_order == 1:
+        J_f = jax.jacfwd(f, argnums=1)(t, m_p0, f_args)
+        H_hat = H - J_f @ H0  # regular * in 1-d case
     else:
-        raise ValueError(f"Invalid value for approximation order of the EKF (has to be 0 or 1): {order}")
+        raise ValueError(f"Invalid value for approximation order of the EKF (has to be 0 or 1): {approximation_order}")
     z_hat = f_at_m_p - H @ m_p  # residual
     return z_hat, H_hat
 
 
 @jax.jit
 def local_error_estimate(Q, H_hat) -> Array:
-    return jnp.sqrt(H_hat @ Q @ H_hat.T)
+    # Max over dimensions d; It's not entirely clear to me if this is the
+    # correct choice, but this seems to be a reasonable choice.
+    return jnp.sqrt((H_hat @ Q @ H_hat.T).max())
 
 
 @jax.jit
 def next_filtering_mean_and_cov(R, m_p, P_p, z_hat, H_hat) -> tuple[Array, Array]:
     # Kalman filter statistics
     S = H_hat @ P_p @ H_hat.T + R  # innovation_covariance
-    S_inv = jnp.linalg.inv(S)  # for 1d, this is scalar
-    K = P_p @ H_hat.T @ S_inv  # Kalman gain
-
+    K = P_p @ H_hat.T @ jnp.linalg.inv(S)  # Kalman gain
     # Next filtering mean/cov
     m_f = m_p + K @ z_hat
-    P_f = (jnp.eye(P_p.shape[-1]) - K @ H_hat) @ P_p
-
+    P_f = (jnp.eye(H_hat.shape[1]) - K @ H_hat) @ P_p
     return m_f, P_f
 
 
-@partial(jax.jit, static_argnames=["f", "f_args", "q", "adaptive_stepsize", "EKF_approximation_order"])
+@partial(jax.jit, static_argnames=["f", "f_args", "d", "q", "adaptive_stepsize", "EKF_approximation_order"])
 def ode_filter_step(
         m_f, P_f,
         f, f_args,
         t,
-        q,
+        d, q,
         h,
         H,
         H0,
@@ -102,16 +112,15 @@ def ode_filter_step(
         stepsize_max_change,  # as in https://arxiv.org/abs/2012.08202
         EKF_approximation_order
         ) -> Tuple[Array, Array, Array, Array, Array, Array]:
-
-    A, Q_hat = discretized_sde(q, h)  # A: transition matrix, B: diffusion matrix
+    A, Q_hat = discretized_sde(d, q, h)  # A: transition matrix, Q: diffusion matrix
     m_p, P_p = next_predictive_mean_and_cov(A, m_f, P_f, Q_hat)
 
-    z_hat, H_hat = ekf_residual(f, t, m_p, H, H0, f_args, order=EKF_approximation_order)
+    z_hat, H_hat = ekf_residual(f, t, m_p, H, H0, f_args,
+                                approximation_order=EKF_approximation_order)
+    sigma_hat = z_hat.T @ jnp.linalg.inv(H @ Q_hat @ H.T) @ z_hat
 
-    sigma_hat = z_hat.T @ z_hat / (H @ Q_hat @ H.T)
-
-    Q = Q_hat * sigma_hat ** 2
-    P_p = P_p - Q_hat + Q  # Use Q for P_p instead of Q_hat (as P_p = A @ P_f @ A.T + Q_hat)
+    Q = Q_hat * sigma_hat
+    P_p = P_p - Q_hat + Q  # Use Q for P_p instead of Q_hat (as P_p = ... + Q_hat)
 
     local_error = local_error_estimate(Q, H_hat)
 
@@ -147,7 +156,7 @@ def linear_interpolation_mean_cov(t0, t1, t, m0, m1, P0, P1) -> Tuple[Array, Arr
 
 
 def ode_filter(
-        x_initial, P0,
+        y_initial, P0,
         f, f_args,
         t0,
         t1,
@@ -170,33 +179,29 @@ def ode_filter(
     # Ensure these are arrays
     h = jnp.array(h)
     t0 = jnp.array(t0)
+    reltol = jnp.array(reltol)
     stepsize_safety_factor = jnp.array(stepsize_safety_factor)
     stepsize_min_change = jnp.array(stepsize_min_change)
     stepsize_max_change = jnp.array(stepsize_max_change)
 
     # TODO list: (priority ordered)
-    # TODO support for d>1
     # TODO Nordsieck-like rescaling
     # TODO Square-root Kalman filter
     # TODO support for q>1
-    d = x_initial.shape[-1]  # TODO how to handle d>1? See Kersting Sullivan Hennig 2020 Appendix B
-    assert d == 1
+    d = y_initial.shape[-1]
     assert q == 1
 
-    # Projections: project SSM state -> y (H0) or SSM state -> y' (H)
-    H0 = jnp.zeros((1, q + 1)).at[0, 0].set(1)
-    H = jnp.zeros((1, q + 1)).at[0, 1].set(1)  # TODO d > 1
-
+    H0, H = ssm_projection_matrices(d, q)
     # TODO Probabilistic Numerics book, p.290, this here just works for q=1
     # Initialization
-    x0 = jnp.stack([x_initial, f(t0, x_initial, f_args)])
-    P0 = jnp.zeros((q + 1, q + 1))  # Assume no uncertainty in x0
+    x0 = jnp.stack([y_initial, f(t0, y_initial, f_args)]).flatten()
+    P0 = jnp.kron(jnp.zeros((q + 1, q + 1)), jnp.eye(d))  # Assume no uncertainty in x0
     # Init. book-keeping of results
     rejected_steps = 0
     ts: list[Array] = [t0]
     filtering_means: list[Array] = [x0]
     filtering_covs: list[Array] = [P0]
-    predictive_means: list[Array] = [x0]  # Only further used if save_all
+    predictive_means: list[Array] = [x0]  # Only used further if save_all
     predictive_covs: list[Array] = [P0]
     # Init. loop variables
     t_prev = t0
@@ -215,7 +220,7 @@ def ode_filter(
     # The ODE filter/solver loop
     while t_prev < t1:
         m_f, P_f, m_p, P_p, local_error, next_h = \
-                ode_filter_step(m_f_prev, P_f_prev, f, f_args, t_prev, q, h, H, H0, R,
+                ode_filter_step(m_f_prev, P_f_prev, f, f_args, t_prev, d, q, h, H, H0, R,
                                 reltol=reltol,
                                 adaptive_stepsize=adaptive_stepsize,
                                 stepsize_safety_factor=stepsize_safety_factor,
@@ -238,7 +243,7 @@ def ode_filter(
                 save_t = saveat[save_t_ind]
                 m, P = linear_interpolation_mean_cov(
                         t_prev, t, save_t, m_f_prev, m_f, P_f_prev, P_f)
-                store_vals(ts, m, P, None, None)
+                store_vals(save_t, m, P, None, None)
                 save_t_ind += 1
             if save_t_ind == saveat.shape[0]:
                 break  # May as well stop here.
@@ -261,6 +266,8 @@ def ode_filter(
     result_dict["covs"] = jnp.array(filtering_covs).squeeze()
     result_dict["H"] = H
     result_dict["H0"] = H0
+    result_dict["d"] = jnp.array(d)
+    result_dict["q"] = jnp.array(q)
     return result_dict
 
 
@@ -272,8 +279,7 @@ def ode_smoother(filter_results: dict[str, Array],
     filtering_means = filter_results["ys"]
     filtering_covs = filter_results["covs"]
     ts = filter_results["ts"]
-    N = ts.shape[0]
-    q = filtering_means.shape[-1] - 1
+    N, d, q = ts.shape[0], filter_results["d"].item(), filter_results["q"].item()
     if saveat is not None:
         save_all = False
         save_t_ind = saveat.shape[0] - 1
@@ -298,7 +304,8 @@ def ode_smoother(filter_results: dict[str, Array],
         m_f, P_f = filtering_means[n, ...], filtering_covs[n, ...]
         t = ts[n]
         h = t_next - t
-        A = discrete_transition_matrix(q, h)
+        A = discrete_transition_matrix(d, q, h)
+        # TODO h and A can go in the step function (and rename below to _step)
         m_s, P_s = ode_ssm_smoother_update(m_f, P_f, A, m_p_next, P_p_next, m_s_next, P_s_next)
 
         # Store results
@@ -328,7 +335,7 @@ def ode_smoother(filter_results: dict[str, Array],
 
 
 def ode_filter_and_smoother(
-        x_initial, P0,
+        y_initial, P0,
         f, f_args,
         t0,
         t1,
@@ -345,7 +352,7 @@ def ode_filter_and_smoother(
         apply_smoother=True
         ) -> dict[str, Array]:
     results = ode_filter(
-        x_initial, P0,
+        y_initial, P0,
         f, f_args,
         t0,
         t1,
@@ -373,7 +380,7 @@ def linear_vf(t, y, args):
 
 
 if __name__ == "__main__":
-    x0 = jnp.array([4])
+    y0 = jnp.array([4.0, 3.5])
     P0 = 0
     alpha = 2.0
     f = linear_vf
@@ -384,11 +391,11 @@ if __name__ == "__main__":
     initial_stepsize = 5e-3
     adaptive_stepsize = False
     N = 100
-    R = 0
+    R = 0  # ~measurement cov (-> cov of z)
     approximation_order = 1
     apply_smoother = True
-    grid = jnp.linspace(t0, t1, 100)
-    prob_sol = ode_filter_and_smoother(x0, P0, f, f_args, t0, t1, q, initial_stepsize, R,
+    grid = jnp.linspace(t0, t1, N)
+    prob_sol = ode_filter_and_smoother(y0, P0, f, f_args, t0, t1, q, initial_stepsize, R,
                                        adaptive_stepsize=adaptive_stepsize,
                                        approximation_order=approximation_order,
                                        saveat=grid,
@@ -398,18 +405,21 @@ if __name__ == "__main__":
     solver = diffrax.Tsit5()
     dt0 = 0.1
     saveat = diffrax.SaveAt(ts=grid)
-    sol = diffrax.diffeqsolve(term, solver, t0, t1, dt0, x0,
+    sol = diffrax.diffeqsolve(term, solver, t0, t1, dt0, y0,
                               args=f_args,
                               saveat=saveat)
     true_d = f(sol.ts, sol.ys, f_args)
 
     label_prefix = "Smoothing" if apply_smoother else "Filtering"
     ts = prob_sol["ts"]
-    ys = prob_sol["ys"][:, 0]
-    y_stddevs = jnp.sqrt(prob_sol["covs"][:, 0, 0])
+    # TODO  in the solvers, dont store x but only y instead.
+    ys = prob_sol["ys"] @ prob_sol["H0"].T
+    y_stddevs = jnp.sqrt(jnp.diagonal(prob_sol["H0"] @ prob_sol["covs"] @ prob_sol["H0"].T, axis1=1, axis2=2))
 
+    # TODO good plotting
     plt.plot(sol.ts, sol.ys, label="Tsit5", linewidth=4, color="black")
-    plt.plot(ts, prob_sol["ys"][:, 0], label=f"{label_prefix} mean", linewidth=1, color="darkred")
-    plt.fill_between(ts, ys - y_stddevs, ys + y_stddevs, label=f"{label_prefix} cov", linewidth=1, color="darkred", alpha=0.3)
+    plt.plot(ts, ys, label=f"{label_prefix} mean", linewidth=2, color="green")
+    plt.fill_between(ts, ys[:, 0] - y_stddevs[:, 0], ys[:, 0] + y_stddevs[:, 0], label=f"{label_prefix} cov", linewidth=1, color="green", alpha=0.3)
+    plt.fill_between(ts, ys[:, 1] - y_stddevs[:, 1], ys[:, 1] + y_stddevs[:, 1], label=f"{label_prefix} cov", linewidth=1, color="green", alpha=0.3)
     plt.legend()
     plt.show()
