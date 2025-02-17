@@ -7,6 +7,7 @@ import diffrax
 import matplotlib.pyplot as plt
 from jaxtyping import Array
 from functools import partial
+from jax.experimental import jet
 
 # Use float64 precision
 jax.config.update("jax_enable_x64", True)
@@ -92,6 +93,26 @@ def nordsieck_coord_transformation(d, q, h) -> tuple[Array, Array]:
 @jax.jit
 def cho_cov_to_stddev(L, H0) -> Array:
     return jnp.sqrt(jnp.diag(H0 @ L @ L.T @ H0.T))
+
+
+def ode_initialization(f, t0, y0, q, f_args):
+    def f_wrapped(x):
+        # make f a function of x only (so it works with jet)
+        return f(t0, x, f_args)
+    y0_tup = (y0,)
+    # stores higher order derivatives f^<i>(y0) (i >= 1)
+    # (see 37.4, 38.2.1 in Probabilistic Numerics book and jet documentation)
+    y_is = (f_wrapped(y0),)
+    for _ in range(q - 1):
+        # TODO This can maybe (?) be accelerated by doubling coefficients
+        # via Newton's method
+        # (see https://openreview.net/pdf?id=SkxEF3FNPH, Algorithm 1)?
+        # but absolutely unnecessary for this project,
+        # and I am not sure if it's applicable (maybe not, haven't looked into it enough).
+        y_i_new, y_is_new = jet.jet(f_wrapped, y0_tup, (y_is,))
+        # above returns tuple[Array, list[Array]], put all into one tuple
+        y_is = (y_i_new,) + (*y_is_new,)
+    return jnp.stack((y0_tup) + y_is)
 
 
 @jax.jit
@@ -242,13 +263,11 @@ def ode_filter(
     stepsize_min_change = jnp.array(stepsize_min_change)
     stepsize_max_change = jnp.array(stepsize_max_change)
 
-    # TODO list: (priority ordered)
-    # TODO support for q>1 (taylor-mode AD for init of x0)
+    # TODO check if uncertainty is correct!
     d = y_initial.shape[-1]
-    assert q == 1
 
     # Initialization
-    x0 = jnp.stack([y_initial, f(t0, y_initial, f_args)]).flatten()
+    x0 = ode_initialization(f, t0, y0, q, f_args).flatten()
     stddev0 = jnp.zeros_like(y_initial)
     L_P0 = jnp.diag(jnp.repeat(stddev0, q + 1))
 
