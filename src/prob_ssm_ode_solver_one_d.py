@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from jaxtyping import Array
 from functools import partial
 
-# TODO decide if using fp64 is a good idea
+# Use float64 precision
 jax.config.update("jax_enable_x64", True)
 
 
@@ -96,7 +96,7 @@ def cho_cov_to_stddev(L, H0) -> Array:
 
 @jax.jit
 def predictive_cov(A, L_f, L_Q):
-    C_p_pre = jnp.vstack([A @ L_f, L_Q])
+    C_p_pre = jnp.vstack([(A @ L_f).T, L_Q.T])
     L_p = jax.scipy.linalg.qr(C_p_pre, mode="economic")[1].T
     return L_p
 
@@ -113,7 +113,7 @@ def ekf_residual(f, t, m_p, H, H0, T, f_args, approximation_order) -> tuple[Arra
     else:
         raise ValueError(f"Invalid value for approximation order of the EKF (has to be 0 or 1): {approximation_order}")
     z_hat = f_at_m_p - H @ T @ m_p  # residual
-    H_hat = H_hat @ T.T  # not 100% sure about transpose here, check later
+    H_hat = H_hat @ T
     return z_hat, H_hat
 
 
