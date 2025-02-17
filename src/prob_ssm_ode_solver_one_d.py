@@ -205,7 +205,7 @@ def ode_filter_step(
 
 
 @partial(jax.jit, static_argnames=["d", "q"])
-def ode_ssm_smoother_update(
+def smoother_step(
         m_f, L_f,
         m_p_next, L_p_next,
         m_s_next, L_s_next,
@@ -220,9 +220,9 @@ def ode_ssm_smoother_update(
     G = L_f @ (A @ L_f).T @ L_p_inv.T @ L_p_inv  # gain
     m_s = m_f + G @ (m_s_next - m_p_next)  # posterior mean
     L_s_pre = jnp.vstack([
-        (jnp.eye(A.shape[0]) - G @ A) @ L_f,  # TODO is last one really L_f?
-        G @ L_Q,
-        G @ L_s_next])
+        ((jnp.eye(A.shape[0]) - G @ A) @ L_f).T,  # TODO is last one really L_f?
+        (G @ L_Q).T,
+        (G @ L_s_next).T])
     L_s = jax.scipy.linalg.qr(L_s_pre, mode="economic")[1].T # posterior cov
     m_s = T @ m_s
     L_s = T @ L_s
@@ -405,7 +405,7 @@ def ode_smoother(f_out: dict[str, Array],
         m_f, L_f = filtering_means[n], filtering_covs[n]
         t = ts[n]
         h = ts[n + 1] - t
-        m_s, L_s, y, stddev = ode_ssm_smoother_update(
+        m_s, L_s, y, stddev = smoother_step(
                 m_f, L_f, m_p_next, L_p_next, m_s_next, L_s_next, A, L_Q, H0, h, d, q)
         # Store results
         if save_all:
