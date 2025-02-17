@@ -136,7 +136,7 @@ def next_filtering_mean_and_cov(m_p, L_p, z_hat, H_hat) -> tuple[Array, Array]:
     # note: as compared to https://arxiv.org/pdf/2012.10106,
     # our sign of z is different (due to different definition).
     m_f = m_p + K @ z_hat  # + or plus here?
-    L_f = (jnp.eye(H_hat.shape[1]) - K @ H_hat) @ L_p
+    L_f = (jnp.eye(L_p.shape[1]) - K @ H_hat) @ L_p
     return m_f, L_f
 
 
@@ -148,6 +148,7 @@ def ode_filter_step(
         d, q,
         A, L_Q_hat,
         H0, H,
+        z_error_scale,
         reltol,
         adaptive_stepsize,
         stepsize_safety_factor,
@@ -162,13 +163,10 @@ def ode_filter_step(
     m_p = A @ m_f  # predictive mean
     z_hat, H_hat = ekf_residual(f, t, m_p, H, H0, T, f_args,
                                 approximation_order=EKF_approximation_order)
-    # TODO can this be improved?
-    # TODO The whole term inside can be precomputed; using triangular_solve
-    sigma_hat = z_hat.T @ jnp.linalg.inv(H @ L_Q_hat @ L_Q_hat.T @ H.T) @ z_hat
+    # See filter function for explanation of z_error_scale
+    sigma_hat = z_error_scale * z_hat.T @ z_hat
     L_Q = jnp.sqrt(sigma_hat) * L_Q_hat
-
     L_p = predictive_cov(A, L_f, L_Q)
-    local_error = local_error_estimate(L_Q, H_hat)
 
     m_f_next, L_f_next = next_filtering_mean_and_cov(m_p, L_p, z_hat, H_hat)
     m_f_next = T @ m_f_next  # Output in original coordinates
@@ -176,6 +174,7 @@ def ode_filter_step(
     y = H0 @ m_f_next
     stddev = cho_cov_to_stddev(L_f_next, H0)
 
+    local_error = local_error_estimate(L_Q, H_hat)
     if adaptive_stepsize:
         stepsize_factor = stepsize_safety_factor * (reltol / local_error) ** (1.0 / (q + 1.0))
         stepsize_factor = jax.lax.clamp(stepsize_min_change, stepsize_factor, stepsize_max_change)
@@ -244,7 +243,6 @@ def ode_filter(
     stepsize_max_change = jnp.array(stepsize_max_change)
 
     # TODO list: (priority ordered)
-    # TODO Square-root Kalman filter
     # TODO support for q>1 (taylor-mode AD for init of x0)
     d = y_initial.shape[-1]
     assert q == 1
@@ -257,9 +255,13 @@ def ode_filter(
     A, Q = discretized_sde_ns(d, q)
     H0, H = ssm_projection_matrices(d, q)
     L_Q = jnp.linalg.cholesky(Q)
+    # the (H @ Q(1) @ H)^{-1} part (see eq. 38.42; p.313 in Probabilistic Numerics book)
+    # reduces to the below error_scale * Id, so this simplifies a lot
+    z_error_scale = jnp.array(2 * q - 1.0)
 
     # Init. book-keeping of results
     rejected_steps = 0
+    accepted_steps = 0
     ts, ys, stddevs = [], [], []
     if saveat is None:
         ts.append(t0)
@@ -280,6 +282,7 @@ def ode_filter(
         m_f, L_f, y, stddev, local_error, next_h, m_p, L_p = \
                 ode_filter_step(m_f_prev, L_f_prev, f, f_args, t_prev, h, d, q,
                                 A, L_Q, H0, H,
+                                z_error_scale,
                                 reltol=reltol,
                                 adaptive_stepsize=adaptive_stepsize,
                                 stepsize_safety_factor=stepsize_safety_factor,
@@ -294,6 +297,7 @@ def ode_filter(
                 rejected_steps += 1
                 continue
         # Step is accepted: store results
+        accepted_steps += 1
         if save_for_smoother:
             ts.append(t)
             filtering_means.append(m_f)
@@ -330,6 +334,8 @@ def ode_filter(
                 "filtering_means": filtering_means,
                 "filtering_covs": filtering_covs,
                 "d": d, "q": q,
+                "num_rejected": rejected_steps,
+                "num_accepted": accepted_steps,
                 "last_y": y, "last_stddev": stddev,
                 "A": A, "L_Q": L_Q, "H0": H0}
     else:
@@ -337,7 +343,8 @@ def ode_filter(
                 "ts": jnp.asarray(ts).squeeze(),
                 "ys": jnp.asarray(ys).squeeze(),
                 "stddevs": jnp.asarray(stddevs).squeeze(),
-                }
+                "num_rejected": rejected_steps,
+                "num_accepted": accepted_steps}
 
 
 def ode_smoother(f_out: dict[str, Array],
@@ -403,8 +410,9 @@ def ode_smoother(f_out: dict[str, Array],
     return {
             "ts": jnp.array(smoothing_ts).squeeze(),
             "ys": jnp.array(smoothing_ys).squeeze(),
-            "stddevs": jnp.array(smoothing_stddevs).squeeze()
-            }
+            "stddevs": jnp.array(smoothing_stddevs).squeeze(),
+            "num_rejected": f_out["num_rejected"],
+            "num_accepted": f_out["num_accepted"]}
 
 
 def ode_filter_and_smoother(
