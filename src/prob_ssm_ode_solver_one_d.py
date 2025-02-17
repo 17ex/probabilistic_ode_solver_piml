@@ -90,10 +90,10 @@ def nordsieck_coord_transformation(d, q, h) -> tuple[Array, Array]:
 
 
 @jax.jit
-def next_predictive_mean_and_cov(A, m_f, P_f, Q):
-    m_p = A @ m_f  # predictive mean
-    P_p = A @ P_f @ A.T + Q  # predictive covariance
-    return m_p, P_p
+def predictive_cov(A, L_f, L_Q):
+    C_p_pre = jnp.vstack([A @ L_f, L_Q])
+    L_p = jax.scipy.linalg.qr(C_p_pre, mode="economic")[1].T
+    return L_p
 
 
 @partial(jax.jit, static_argnames=["f", "f_args", "approximation_order"])
@@ -113,32 +113,38 @@ def ekf_residual(f, t, m_p, H, H0, T, f_args, approximation_order) -> tuple[Arra
 
 
 @jax.jit
-def local_error_estimate(Q, H_hat) -> Array:
+def local_error_estimate(L_Q, H_hat) -> Array:
     # Max over dimensions d; It's not entirely clear to me if this is the
     # correct choice, but this seems to be a reasonable choice.
-    return jnp.sqrt((H_hat @ Q @ H_hat.T).max())
+    return jnp.sqrt((H_hat @ L_Q @ L_Q.T @ H_hat.T).max())
 
 
 @jax.jit
-def next_filtering_mean_and_cov(R, m_p, P_p, z_hat, H_hat) -> tuple[Array, Array]:
+def next_filtering_mean_and_cov(m_p, L_p, z_hat, H_hat) -> tuple[Array, Array]:
     # Kalman filter statistics
-    S = H_hat @ P_p @ H_hat.T + R  # innovation_covariance
-    K = P_p @ H_hat.T @ jnp.linalg.inv(S)  # Kalman gain
+    S_pre = (H_hat @ L_p).T
+    L_S = jax.scipy.linalg.qr(S_pre, mode="economic")[1].T  # innovation cov
+    C_cross = L_p @ L_p.T @ H_hat.T
+    L_S_inv = jax.scipy.linalg.solve_triangular(L_S, jnp.eye(L_S.shape[0]), lower=True)
+    K = C_cross @ L_S_inv.T @ L_S_inv  # Kalman gain
     # Next filtering mean/cov
-    m_f = m_p + K @ z_hat
-    P_f = (jnp.eye(H_hat.shape[1]) - K @ H_hat) @ P_p
-    return m_f, P_f
+    m_f = m_p + K @ z_hat  # TODO - or plus here?
+    # -> in https://arxiv.org/pdf/2012.10106, they used -, but with + it works?
+    # However, something is still very wrong with my implementation,
+    # it works, but grows too fast; effect vanishes with smaller step sizes,
+    # but definitely wrong, and uncertainty estimation also wrong
+    L_f = (jnp.eye(H_hat.shape[1]) - K @ H_hat) @ L_p
+    return m_f, L_f
 
 
 @partial(jax.jit, static_argnames=["f", "f_args", "d", "q", "adaptive_stepsize", "EKF_approximation_order"])
 def ode_filter_step(
-        m_f, P_f,
+        m_f, L_f,
         f, f_args,
         t, h,
         d, q,
-        A, Q_hat,
+        A, L_Q_hat,
         H0, H,
-        R,
         reltol,
         adaptive_stepsize,
         stepsize_safety_factor,
@@ -147,31 +153,32 @@ def ode_filter_step(
         EKF_approximation_order
         ) -> Tuple[Array, Array, Array, Array, Array, Array, Array, Array]:
     T, T_inv = nordsieck_coord_transformation(d, q, h)
-    m_f_scaled = T_inv @ m_f
-    P_f_scaled = T_inv @ P_f @ T_inv.T
-    m_p, P_p = next_predictive_mean_and_cov(A, m_f_scaled, P_f_scaled, Q_hat)
+    m_f = T_inv @ m_f
+    L_f = T_inv @ L_f
 
+    m_p = A @ m_f  # predictive mean
     z_hat, H_hat = ekf_residual(f, t, m_p, H, H0, T, f_args,
                                 approximation_order=EKF_approximation_order)
-    sigma_hat = z_hat.T @ jnp.linalg.inv(H @ Q_hat @ H.T) @ z_hat
+    # TODO can this be improved?
+    # TODO The whole term inside can be precomputed; using triangular_solve
+    sigma_hat = z_hat.T @ jnp.linalg.inv(H @ L_Q_hat @ L_Q_hat.T @ H.T) @ z_hat
+    L_Q = jnp.sqrt(sigma_hat) * L_Q_hat
 
-    Q = Q_hat * sigma_hat
-    P_p = P_p - Q_hat + Q  # Use Q for P_p instead of Q_hat (as P_p = ... + Q_hat)
+    L_p = predictive_cov(A, L_f, L_Q)
+    local_error = local_error_estimate(L_Q, H_hat)
 
-    local_error = local_error_estimate(Q, H_hat)
-
-    m_f_next, P_f_next = next_filtering_mean_and_cov(R, m_p, P_p, z_hat, H_hat)
+    m_f_next, L_f_next = next_filtering_mean_and_cov(m_p, L_p, z_hat, H_hat)
     m_f_next = T @ m_f_next  # Output in original coordinates
-    P_f_next = T @ P_f_next @ T.T
+    L_f_next = T @ L_f_next
     y = H0 @ m_f_next
-    stddev = jnp.sqrt(jnp.diag(H0 @ P_f_next @ H0.T))
+    stddev = jnp.sqrt(jnp.diag(H0 @ L_f_next @ L_f_next.T @ H0.T))
 
     if adaptive_stepsize:
         stepsize_factor = stepsize_safety_factor * (reltol / local_error) ** (1.0 / (q + 1.0))
         stepsize_factor = jax.lax.clamp(stepsize_min_change, stepsize_factor, stepsize_max_change)
         h = (h * stepsize_factor).squeeze()
 
-    return m_f_next, P_f_next, y, stddev, local_error, h, m_p, P_p
+    return m_f_next, L_f_next, y, stddev, local_error, h, m_p, L_p
 
 
 @partial(jax.jit, static_argnames=["d", "q"])
@@ -205,13 +212,12 @@ def linear_interpolation_mean_cov(t0, t1, t, m0, m1, P0, P1) -> Tuple[Array, Arr
 
 
 def ode_filter(
-        y_initial, P0,
+        y_initial,
         f, f_args,
         t0,
         t1,
         q,
         h,
-        R,
         saveat,
         save_for_smoother,
         reltol,
@@ -237,10 +243,11 @@ def ode_filter(
     # Initialization
     x0 = jnp.stack([y_initial, f(t0, y_initial, f_args)]).flatten()
     stddev0 = jnp.zeros_like(y_initial)
-    P0 = jnp.diag(jnp.repeat(stddev0, q + 1))  # Assume no uncertainty in x0
+    L_P0 = jnp.diag(jnp.repeat(stddev0, q + 1))
 
     A, Q = discretized_sde_ns(d, q)
     H0, H = ssm_projection_matrices(d, q)
+    L_Q = jnp.linalg.cholesky(Q)
 
     # Init. book-keeping of results
     rejected_steps = 0
@@ -252,18 +259,18 @@ def ode_filter(
     filtering_means, filtering_covs, predictive_means, predictive_covs = [], [], [], []
     if save_for_smoother:
         filtering_means.append(x0)
-        filtering_covs.append(P0)
+        filtering_covs.append(L_P0)
     # Init. loop variables
     t_prev = t0
-    m_f_prev, P_f_prev = x0, P0  # Filtering parameters (of previous step)
+    m_f_prev, L_f_prev = x0, L_P0  # Filtering parameters (of previous step)
     y_prev, stddev_prev = y_initial, stddev0
     save_t_ind = 0
 
     # The ODE filter/solver loop
     while t_prev < t1:
-        m_f, P_f, y, stddev, local_error, next_h, m_p, P_p = \
-                ode_filter_step(m_f_prev, P_f_prev, f, f_args, t_prev, h, d, q,
-                                A, Q, H0, H, R,
+        m_f, L_f, y, stddev, local_error, next_h, m_p, L_p = \
+                ode_filter_step(m_f_prev, L_f_prev, f, f_args, t_prev, h, d, q,
+                                A, L_Q, H0, H,
                                 reltol=reltol,
                                 adaptive_stepsize=adaptive_stepsize,
                                 stepsize_safety_factor=stepsize_safety_factor,
@@ -281,9 +288,9 @@ def ode_filter(
         if save_for_smoother:
             ts.append(t)
             filtering_means.append(m_f)
-            filtering_covs.append(P_f)
+            filtering_covs.append(L_f)
             predictive_means.append(m_p)
-            predictive_covs.append(P_p)
+            predictive_covs.append(L_p)
         else:
             if saveat is None:
                 ts.append(t)
@@ -302,7 +309,7 @@ def ode_filter(
                 if save_t_ind == saveat.shape[0]:
                     break  # May as well stop here.
         # Update loop variables
-        t_prev, m_f_prev, P_f_prev = t, m_f, P_f
+        t_prev, m_f_prev, L_f_prev = t, m_f, L_f
         y_prev, stddev_prev = y, stddev
 
     # Format and return results
@@ -392,13 +399,12 @@ def ode_smoother(f_out: dict[str, Array],
 
 
 def ode_filter_and_smoother(
-        y_initial, P0,
+        y_initial,
         f, f_args,
         t0,
         t1,
         q,
         h,
-        R,
         saveat: Optional[Array] = None,
         reltol=1e-1,
         adaptive_stepsize=True,
@@ -409,13 +415,12 @@ def ode_filter_and_smoother(
         apply_smoother=True
         ) -> dict[str, Array]:
     results = ode_filter(
-        y_initial, P0,
+        y_initial,
         f, f_args,
         t0,
         t1,
         q,
         h,
-        R,
         save_for_smoother=apply_smoother,
         saveat=(None if apply_smoother else saveat),
         reltol=reltol,
@@ -439,7 +444,6 @@ def linear_vf(t, y, args):
 
 if __name__ == "__main__":
     y0 = jnp.array([4.0, 3.5])
-    P0 = 0
     alpha = 2.0
     f = linear_vf
     f_args = (alpha, )
@@ -449,12 +453,11 @@ if __name__ == "__main__":
     initial_stepsize = 5e-3
     adaptive_stepsize = False
     N = 100
-    R = 0  # ~measurement cov (-> cov of z)
     approximation_order = 1
-    apply_smoother = True
+    apply_smoother = False
     grid = jnp.linspace(t0, t1, N)
     use_grid = True
-    prob_sol = ode_filter_and_smoother(y0, P0, f, f_args, t0, t1, q, initial_stepsize, R,
+    prob_sol = ode_filter_and_smoother(y0, f, f_args, t0, t1, q, initial_stepsize,
                                        adaptive_stepsize=adaptive_stepsize,
                                        approximation_order=approximation_order,
                                        saveat=grid if use_grid else None,
