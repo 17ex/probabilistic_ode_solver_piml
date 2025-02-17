@@ -90,6 +90,11 @@ def nordsieck_coord_transformation(d, q, h) -> tuple[Array, Array]:
 
 
 @jax.jit
+def cho_cov_to_stddev(L, H0) -> Array:
+    return jnp.sqrt(jnp.diag(H0 @ L @ L.T @ H0.T))
+
+
+@jax.jit
 def predictive_cov(A, L_f, L_Q):
     C_p_pre = jnp.vstack([A @ L_f, L_Q])
     L_p = jax.scipy.linalg.qr(C_p_pre, mode="economic")[1].T
@@ -128,11 +133,9 @@ def next_filtering_mean_and_cov(m_p, L_p, z_hat, H_hat) -> tuple[Array, Array]:
     L_S_inv = jax.scipy.linalg.solve_triangular(L_S, jnp.eye(L_S.shape[0]), lower=True)
     K = C_cross @ L_S_inv.T @ L_S_inv  # Kalman gain
     # Next filtering mean/cov
-    m_f = m_p + K @ z_hat  # TODO - or plus here?
-    # -> in https://arxiv.org/pdf/2012.10106, they used -, but with + it works?
-    # However, something is still very wrong with my implementation,
-    # it works, but grows too fast; effect vanishes with smaller step sizes,
-    # but definitely wrong, and uncertainty estimation also wrong
+    # note: as compared to https://arxiv.org/pdf/2012.10106,
+    # our sign of z is different (due to different definition).
+    m_f = m_p + K @ z_hat  # + or plus here?
     L_f = (jnp.eye(H_hat.shape[1]) - K @ H_hat) @ L_p
     return m_f, L_f
 
@@ -171,7 +174,7 @@ def ode_filter_step(
     m_f_next = T @ m_f_next  # Output in original coordinates
     L_f_next = T @ L_f_next
     y = H0 @ m_f_next
-    stddev = jnp.sqrt(jnp.diag(H0 @ L_f_next @ L_f_next.T @ H0.T))
+    stddev = cho_cov_to_stddev(L_f_next, H0)
 
     if adaptive_stepsize:
         stepsize_factor = stepsize_safety_factor * (reltol / local_error) ** (1.0 / (q + 1.0))
@@ -183,23 +186,29 @@ def ode_filter_step(
 
 @partial(jax.jit, static_argnames=["d", "q"])
 def ode_ssm_smoother_update(
-        m_f, P_f,
-        m_p_next, P_p_next,
-        m_s_next, P_s_next,
-        A, H0, h, d, q) -> Tuple[Array, Array, Array, Array]:
+        m_f, L_f,
+        m_p_next, L_p_next,
+        m_s_next, L_s_next,
+        A, L_Q, H0, h, d, q) -> Tuple[Array, Array, Array, Array]:
     T, T_inv = nordsieck_coord_transformation(d, q, h)
     m_s_next = T_inv @ m_s_next
-    P_s_next = T_inv @ P_s_next @ T_inv.T
+    L_s_next = T_inv @ L_s_next
     m_f = T_inv @ m_f
-    P_f = T_inv @ P_f @ T_inv.T
-    G = P_f @ A.T @ jnp.linalg.inv(P_p_next)  # gain
+    L_f = T_inv @ L_f
+    L_p_inv = jax.scipy.linalg.solve_triangular(
+            L_p_next, jnp.eye(L_p_next.shape[0]), lower=True)
+    G = L_f @ (A @ L_f).T @ L_p_inv.T @ L_p_inv  # gain
     m_s = m_f + G @ (m_s_next - m_p_next)  # posterior mean
-    P_s = P_f + G @ (P_s_next - P_p_next) @ G.T  # posterior covariance
+    L_s_pre = jnp.vstack([
+        (jnp.eye(A.shape[0]) - G @ A) @ L_f,  # TODO is last one really L_f?
+        G @ L_Q,
+        G @ L_s_next])
+    L_s = jax.scipy.linalg.qr(L_s_pre, mode="economic")[1].T # posterior cov
     m_s = T @ m_s
-    P_s = T @ P_s @ T.T
+    L_s = T @ L_s
     y_s = H0 @ m_s
-    stddev_s = jnp.sqrt(jnp.diag(H0 @ P_s @ H0.T))
-    return m_s, P_s, y_s, stddev_s
+    stddev_s = cho_cov_to_stddev(L_s, H0)
+    return m_s, L_s, y_s, stddev_s
 
 
 @jax.jit
@@ -322,7 +331,7 @@ def ode_filter(
                 "filtering_covs": filtering_covs,
                 "d": d, "q": q,
                 "last_y": y, "last_stddev": stddev,
-                "A": A, "H0": H0}
+                "A": A, "L_Q": L_Q, "H0": H0}
     else:
         return {
                 "ts": jnp.asarray(ts).squeeze(),
@@ -340,7 +349,7 @@ def ode_smoother(f_out: dict[str, Array],
     filtering_covs = f_out["filtering_covs"]
     ts = f_out["ts"]
     N, d, q = len(ts), f_out["d"], f_out["q"]
-    A, H0 = f_out["A"], f_out["H0"]
+    A, L_Q, H0 = f_out["A"], f_out["L_Q"], f_out["H0"]
     save_t_ind = 0
     if saveat is not None:
         save_all = False
@@ -349,7 +358,7 @@ def ode_smoother(f_out: dict[str, Array],
         save_all = True
     t_next = ts[-1]
     m_s_next = filtering_means[-1]
-    P_s_next = filtering_covs[-1]
+    L_s_next = filtering_covs[-1]
     y_next = f_out["last_y"]
     stddev_next = f_out["last_stddev"]
     smoothing_ts = [t_next]
@@ -366,12 +375,12 @@ def ode_smoother(f_out: dict[str, Array],
         # [N - 2, 1]
         # predictive params hold one less element at the start,
         # so eg predictive_means[n] actually corresponds to m_p[n+1]
-        m_p_next, P_p_next = predictive_means[n], predictive_covs[n]
-        m_f, P_f = filtering_means[n], filtering_covs[n]
+        m_p_next, L_p_next = predictive_means[n], predictive_covs[n]
+        m_f, L_f = filtering_means[n], filtering_covs[n]
         t = ts[n]
         h = ts[n + 1] - t
-        m_s, P_s, y, stddev = ode_ssm_smoother_update(
-                m_f, P_f, m_p_next, P_p_next, m_s_next, P_s_next, A, H0, h, d, q)
+        m_s, L_s, y, stddev = ode_ssm_smoother_update(
+                m_f, L_f, m_p_next, L_p_next, m_s_next, L_s_next, A, L_Q, H0, h, d, q)
         # Store results
         if save_all:
             store_vals(t, y, stddev)
@@ -379,13 +388,13 @@ def ode_smoother(f_out: dict[str, Array],
             while save_t_ind >= 0 and saveat[save_t_ind] >= t:
                 # interpolate over saveat points
                 save_t = saveat[save_t_ind]
-                m, P = linear_interpolation_mean_cov(
+                m, L = linear_interpolation_mean_cov(
                         t, t_next, save_t, y, y_next, stddev, stddev_next)
-                store_vals(save_t, m, P)
+                store_vals(save_t, m, L)
                 save_t_ind -= 1
             if save_t_ind < 0:
                 break  # May as well stop here.
-        m_s_next, P_s_next, t_next = m_s, P_s, t
+        m_s_next, L_s_next, t_next = m_s, L_s, t
         y_next, stddev_next = y, stddev
 
     if not save_all:
@@ -454,7 +463,7 @@ if __name__ == "__main__":
     adaptive_stepsize = False
     N = 100
     approximation_order = 1
-    apply_smoother = False
+    apply_smoother = True
     grid = jnp.linspace(t0, t1, N)
     use_grid = True
     prob_sol = ode_filter_and_smoother(y0, f, f_args, t0, t1, q, initial_stepsize,
