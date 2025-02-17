@@ -197,8 +197,8 @@ def ode_ssm_smoother_update(
 
 @jax.jit
 def linear_interpolation_mean_cov(t0, t1, t, m0, m1, P0, P1) -> Tuple[Array, Array]:
-    w0 = (t - t0) / (t1 - t0)
-    w1 = (t1 - t) / (t1 - t0)
+    w0 = (t1 - t) / (t1 - t0)
+    w1 = (t - t0) / (t1 - t0)
     m = w0 * m0 + w1 * m1
     P = w0 * P0 + w1 * P1
     return m, P
