@@ -3,15 +3,12 @@ import jax
 import scipy
 import numpy as np
 import jax.numpy as jnp
-import diffrax
-import matplotlib.pyplot as plt
 from jaxtyping import Array
 from functools import partial
 from jax.experimental import jet
 
 # Use float64 precision
 jax.config.update("jax_enable_x64", True)
-
 
 @partial(jax.jit, static_argnames=["d", "q"])
 def discrete_transition_matrix(d: int, q: int, h: float) -> Array:
@@ -38,13 +35,6 @@ def discrete_diffusion_matrix(d: int, q: int, h: float) -> Array:
     return jnp.kron(Q, jnp.eye(d))
 
 
-@partial(jax.jit, static_argnames=["d", "q"])
-def discretized_sde(d: int, q: int, h: float) -> tuple[Array, Array]:
-    A = discrete_transition_matrix(d, q, h)
-    Q = discrete_diffusion_matrix(d, q, h)
-    return A, Q
-
-
 def discrete_transition_matrix_ns(d: int, q: int) -> Array:
     # constructs A[i, j] = binom(q - i, q - j) if j - i >= 0, else 0
     # calculation in int should (?) be more accurate than in float (with gamma)
@@ -62,12 +52,6 @@ def discrete_diffusion_matrix_ns(d: int, q: int) -> Array:
     return jnp.kron(Q, jnp.eye(d))
 
 
-def discretized_sde_ns(d: int, q: int) -> tuple[Array, Array]:
-    A = discrete_transition_matrix_ns(d, q)
-    Q = discrete_diffusion_matrix_ns(d, q)
-    return A, Q
-
-
 def ssm_projection_matrices(d, q) -> tuple[Array, Array]:
     # Projections: project SSM state -> y (H0) or SSM state -> y' (H)
     H0 = jnp.zeros((1, q + 1)).at[0, 0].set(1.0)
@@ -78,7 +62,6 @@ def ssm_projection_matrices(d, q) -> tuple[Array, Array]:
     return H0, H
 
 
-@partial(jax.jit, static_argnames=["d", "q"])
 def nordsieck_coord_transformation(d, q, h) -> tuple[Array, Array]:
     qs = jnp.flip(jnp.arange(q + 1), 0)
     # cumprod vs factorial? Probably will make no difference as both
@@ -90,7 +73,6 @@ def nordsieck_coord_transformation(d, q, h) -> tuple[Array, Array]:
     return T, T_inv
 
 
-@jax.jit
 def cho_cov_to_stddev(L, H0) -> Array:
     return jnp.sqrt(jnp.diag(H0 @ L @ L.T @ H0.T))
 
@@ -115,14 +97,12 @@ def ode_initialization(f, t0, y0, q, f_args):
     return jnp.stack((y0_tup) + y_is)
 
 
-@jax.jit
 def predictive_cov(A, L_f, L_Q):
     C_p_pre = jnp.vstack([(A @ L_f).T, L_Q.T])
     L_p = jax.scipy.linalg.qr(C_p_pre, mode="economic")[1].T
     return L_p
 
 
-@partial(jax.jit, static_argnames=["f", "f_args", "approximation_order"])
 def ekf_residual(f, t, m_p, H, H0, T, f_args, approximation_order) -> tuple[Array, Array]:
     m_p0 = H0 @ T @ m_p
     f_at_m_p = f(t, m_p0, f_args)
@@ -138,14 +118,12 @@ def ekf_residual(f, t, m_p, H, H0, T, f_args, approximation_order) -> tuple[Arra
     return z_hat, H_hat
 
 
-@jax.jit
 def local_error_estimate(L_Q, H_hat) -> Array:
     # Max over dimensions d; It's not entirely clear to me if this is the
     # correct choice, but this seems to be a reasonable choice.
     return jnp.sqrt((H_hat @ L_Q @ L_Q.T @ H_hat.T).max())
 
 
-@jax.jit
 def next_filtering_mean_and_cov(m_p, L_p, z_hat, H_hat) -> tuple[Array, Array]:
     # Kalman filter statistics
     S_pre = (H_hat @ L_p).T
@@ -263,15 +241,15 @@ def ode_filter(
     stepsize_min_change = jnp.array(stepsize_min_change)
     stepsize_max_change = jnp.array(stepsize_max_change)
 
-    # TODO check if uncertainty is correct!
     d = y_initial.shape[-1]
 
     # Initialization
-    x0 = ode_initialization(f, t0, y0, q, f_args).flatten()
+    x0 = ode_initialization(f, t0, y_initial, q, f_args).flatten()
     stddev0 = jnp.zeros_like(y_initial)
     L_P0 = jnp.diag(jnp.repeat(stddev0, q + 1))
 
-    A, Q = discretized_sde_ns(d, q)
+    A = discrete_transition_matrix_ns(d, q)
+    Q = discrete_diffusion_matrix_ns(d, q)
     H0, H = ssm_projection_matrices(d, q)
     L_Q = jnp.linalg.cholesky(Q)
     # the (H @ Q(1) @ H)^{-1} part (see eq. 38.42; p.313 in Probabilistic Numerics book)
@@ -469,64 +447,3 @@ def ode_filter_and_smoother(
     if apply_smoother:
         results = ode_smoother(results, saveat=saveat)
     return results
-
-
-@partial(jax.jit, static_argnames=["args"])
-def linear_vf(t, y, args):
-    alpha = args[0]
-    return alpha * y
-
-
-@partial(jax.jit, static_argnames=["args"])
-def lotka_volterra_vf(t, y, args) -> Array:
-    prey, predator = y[..., 0], y[..., 1]
-    alpha, beta, gamma, delta = args
-    d_prey: Array = alpha * prey - beta * prey * predator
-    d_predator: Array = -gamma * predator + delta * prey * predator
-    return jnp.array([d_prey, d_predator])
-
-
-if __name__ == "__main__":
-    y0 = jnp.array([10.0, 10.0])
-    f = lotka_volterra_vf
-    f_args = (0.1, 0.02, 0.4, 0.02)
-    q = 3
-    t0 = 0.0
-    t1 = 140.0
-    N = 1000
-    initial_stepsize = 1e0
-    approximation_order = 0
-    apply_smoother = True
-    adaptive_stepsize = False
-    grid = jnp.linspace(t0, t1, N)
-    use_grid = True
-    reltol = 1e-1
-    prob_sol = ode_filter_and_smoother(y0, f, f_args, t0, t1, q, initial_stepsize,
-                                       reltol=reltol,
-                                       adaptive_stepsize=adaptive_stepsize,
-                                       approximation_order=approximation_order,
-                                       saveat=grid if use_grid else None,
-                                       apply_smoother=apply_smoother)
-
-    term = diffrax.ODETerm(f)
-    solver = diffrax.Tsit5()
-    dt0 = 1e-1
-    saveat = diffrax.SaveAt(ts=grid)
-    sol = diffrax.diffeqsolve(term, solver, t0, t1, dt0, y0,
-                              args=f_args,
-                              saveat=saveat)
-    true_d = f(sol.ts, sol.ys, f_args)
-
-    label_prefix = "Smoothing" if apply_smoother else "Filtering"
-    ts = prob_sol["ts"]
-    ys = prob_sol["ys"]
-    y_stddevs = prob_sol["stddevs"]
-    print(f"Steps: rejected: {prob_sol['num_rejected']}, accepted: {prob_sol['num_accepted']}")
-
-    # TODO good plotting
-    plt.plot(sol.ts, sol.ys, label="Tsit5", linewidth=2, color="grey")
-    plt.plot(ts, ys, label=f"{label_prefix} mean", linewidth=2, color="green")
-    plt.fill_between(ts, ys[:, 0] - y_stddevs[:, 0], ys[:, 0] + y_stddevs[:, 0], label=f"{label_prefix} cov", linewidth=1, color="green", alpha=0.3)
-    plt.fill_between(ts, ys[:, 1] - y_stddevs[:, 1], ys[:, 1] + y_stddevs[:, 1], label=f"{label_prefix} cov", linewidth=1, color="green", alpha=0.3)
-    plt.legend()
-    plt.show()
