@@ -442,7 +442,7 @@ def ode_filter_and_smoother(
         q,
         h,
         saveat: Optional[Array] = None,
-        reltol=1e-1,
+        reltol=1e-3,
         adaptive_stepsize=True,
         stepsize_safety_factor=0.9,
         stepsize_min_change=0.2,
@@ -477,23 +477,32 @@ def linear_vf(t, y, args):
     return alpha * y
 
 
+@partial(jax.jit, static_argnames=["args"])
+def lotka_volterra_vf(t, y, args) -> Array:
+    prey, predator = y[..., 0], y[..., 1]
+    alpha, beta, gamma, delta = args
+    d_prey: Array = alpha * prey - beta * prey * predator
+    d_predator: Array = -gamma * predator + delta * prey * predator
+    return jnp.array([d_prey, d_predator])
+
 
 if __name__ == "__main__":
-    y0 = jnp.array([4.0, 3.5])
-    alpha = 2.0
-    f = linear_vf
-    f_args = (alpha, )
-    q = 1
+    y0 = jnp.array([10.0, 10.0])
+    f = lotka_volterra_vf
+    f_args = (0.1, 0.02, 0.4, 0.02)
+    q = 3
     t0 = 0.0
-    t1 = 3.0
-    initial_stepsize = 5e-3
-    adaptive_stepsize = False
-    N = 100
-    approximation_order = 1
+    t1 = 140.0
+    N = 1000
+    initial_stepsize = 1e0
+    approximation_order = 0
     apply_smoother = True
+    adaptive_stepsize = False
     grid = jnp.linspace(t0, t1, N)
     use_grid = True
+    reltol = 1e-1
     prob_sol = ode_filter_and_smoother(y0, f, f_args, t0, t1, q, initial_stepsize,
+                                       reltol=reltol,
                                        adaptive_stepsize=adaptive_stepsize,
                                        approximation_order=approximation_order,
                                        saveat=grid if use_grid else None,
@@ -501,7 +510,7 @@ if __name__ == "__main__":
 
     term = diffrax.ODETerm(f)
     solver = diffrax.Tsit5()
-    dt0 = 0.1
+    dt0 = 1e-1
     saveat = diffrax.SaveAt(ts=grid)
     sol = diffrax.diffeqsolve(term, solver, t0, t1, dt0, y0,
                               args=f_args,
@@ -512,9 +521,10 @@ if __name__ == "__main__":
     ts = prob_sol["ts"]
     ys = prob_sol["ys"]
     y_stddevs = prob_sol["stddevs"]
+    print(f"Steps: rejected: {prob_sol['num_rejected']}, accepted: {prob_sol['num_accepted']}")
 
     # TODO good plotting
-    plt.plot(sol.ts, sol.ys, label="Tsit5", linewidth=4, color="black")
+    plt.plot(sol.ts, sol.ys, label="Tsit5", linewidth=2, color="grey")
     plt.plot(ts, ys, label=f"{label_prefix} mean", linewidth=2, color="green")
     plt.fill_between(ts, ys[:, 0] - y_stddevs[:, 0], ys[:, 0] + y_stddevs[:, 0], label=f"{label_prefix} cov", linewidth=1, color="green", alpha=0.3)
     plt.fill_between(ts, ys[:, 1] - y_stddevs[:, 1], ys[:, 1] + y_stddevs[:, 1], label=f"{label_prefix} cov", linewidth=1, color="green", alpha=0.3)
